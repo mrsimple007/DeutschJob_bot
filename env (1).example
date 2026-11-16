@@ -1,0 +1,22 @@
+TELEGRAM_TOKEN=
+SUPABASE_URL=https://xxxx.supabase.co
+SUPABASE_SERVICE_KEY=
+GEMINI_API_KEY=
+GEMINI_API_KEY_1=
+GEMINI_API_KEY_2=
+GEMINI_MODEL=gemini-3.6-flash
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=465
+SMTP_USER=
+SMTP_PASS=
+DRY_RUN=1
+MAX_SHOW=10
+
+# --- new ---
+SUPABASE_BUCKET=deutschjob-cvs
+# python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+ENCRYPTION_KEY=
+# your Telegram id(s), comma separated (get it from @userinfobot)
+ADMIN_IDS=
+# SMTP_* above = optional shared sender, only used in DRY_RUN unless this is 1 (not recommended)
+ALLOW_SHARED_SENDER=0

@@ -1,0 +1,8 @@
+python-telegram-bot[job-queue]>=20.0
+google-generativeai
+python-docx
+httpx
+python-dotenv
+supabase>=2.0
+tzdata
+cryptography
