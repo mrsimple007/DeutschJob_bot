@@ -6,6 +6,9 @@ from zoneinfo import ZoneInfo
 import dotenv
 
 dotenv.load_dotenv()
+import re   # at the top, if not already imported
+
+ADMIN_IDS = {int(x) for x in re.split(r"[,\s;]+", os.getenv("ADMIN_IDS", "")) if x.isdigit()}
 
 # ------------------------------------------------------------------ logging
 logging.basicConfig(
@@ -74,7 +77,7 @@ DETAIL_PATHS = ["/pc/v4/jobdetails/{}", "/pc/v3/jobdetails/{}"]
 # ------------------------------------------------------------------ storage / security / admin
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "deutschjob-cvs")
 ENCRYPTION_KEY = os.environ["ENCRYPTION_KEY"]   # Fernet key, encrypts clients' SMTP passwords
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x]
+ADMIN_IDS = {int(x) for x in re.split(r"[,\s;]+", os.getenv("ADMIN_IDS", "")) if x.isdigit()}
 # Shared sender (SMTP_USER above) is used only in DRY_RUN, or if you explicitly allow it.
 ALLOW_SHARED_SENDER = os.getenv("ALLOW_SHARED_SENDER", "0") == "1"
 DIGEST_HOUR = 18   # daily admin summary, Berlin time

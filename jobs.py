@@ -130,7 +130,7 @@ async def search_with_fallback(client, title: str, where):
     return []
 
 
-async def find_jobs(titles: list, where, limit: int = 15) -> list:
+async def find_jobs(titles: list, where, limit: int = 25) -> list:
     titles = titles[:4]
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         with step(f"BA search for {len(titles)} titles (where={where or 'Germany'})"):
