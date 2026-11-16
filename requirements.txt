@@ -6,3 +6,4 @@ python-dotenv
 supabase>=2.0
 tzdata
 cryptography
+gspread
