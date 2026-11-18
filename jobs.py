@@ -7,6 +7,14 @@ import db
 from config import (BA_BASE, BA_HEADERS, SEARCH_PATHS, DETAIL_PATHS, EMAIL_RE,
                     CACHE_TTL_H, log, step)
 
+# ------------------------------------------------------------------ settings
+MAX_TITLES = 6          # job titles searched per scan
+PAGE_SIZE = 50          # results per API page
+MAX_PAGES = 3           # pages per title (3 x 50 = up to 150 hits per title)
+MAX_JOBS = 200          # unique jobs kept for the detail fetch
+DETAIL_CONCURRENCY = 8  # parallel detail requests
+CACHE_VERSION = "v2"    # bump to invalidate old cached results
+
 # ------------------------------------------------------------------ email filtering
 BAD_LOCAL = ("noreply", "no-reply", "donotreply", "do-not-reply", "datenschutz", "privacy",
              "dataprotection", "dsgvo", "abuse", "postmaster", "webmaster", "mailer-daemon")
@@ -47,16 +55,17 @@ def extract_hits(data) -> list:
     for key in ("ergebnisliste", "stellenangebote", "jobs", "items", "results"):
         if isinstance(data.get(key), list):
             return data[key]
-    if data.get("maxErgebnisse", 0) == 0 or "ergebnisliste" not in data:
-        return []  # genuinely empty result
+    if not data.get("maxErgebnisse"):
+        return []  # genuinely empty result (or page beyond the last one)
     log.warning("[ba] unknown response shape, top-level keys: %s", list(data.keys()))
     return []
 
 
-async def ba_search(client: httpx.AsyncClient, what: str, where, size: int = 10) -> list:
-    """Search jobs. Tries several endpoint versions; a 403/404 means that route doesn't exist."""
+async def ba_search(client: httpx.AsyncClient, what: str, where,
+                    size: int = PAGE_SIZE, page: int = 1) -> list:
+    """Search jobs. Tries several endpoint versions; a 400/403/404 means that route doesn't exist."""
     global _search_path_cache
-    params = {"was": what, "size": size, "page": 1, "angebotsart": 1}
+    params = {"was": what, "size": size, "page": page, "angebotsart": 1}
     if where:
         params["wo"] = where
         params["umkreis"] = 50
@@ -85,7 +94,8 @@ async def ba_search(client: httpx.AsyncClient, what: str, where, size: int = 10)
                 log.info("[ba] working search endpoint: %s", path)
                 _search_path_cache = path
             hits = extract_hits(data)
-            log.info("[ba] '%s' (where=%s) -> %d hits via %s", what, where or "Germany", len(hits), path)
+            log.info("[ba] '%s' page %d (where=%s) -> %d hits via %s",
+                     what, page, where or "Germany", len(hits), path)
             return hits
     raise RuntimeError(f"Bundesagentur search failed for '{what}': {last}")
 
@@ -117,25 +127,33 @@ def clean_html(s: str) -> str:
     return re.sub(r"\s+", " ", html.unescape(s)).strip()
 
 
-async def search_with_fallback(client, title: str, where, pages: int = 3):
+async def search_with_fallback(client, title: str, where, pages: int = MAX_PAGES):
+    """Up to `pages` pages for the full title; if nothing, retry with single keywords."""
     hits = []
     for p in range(1, pages + 1):
-        page_hits = await ba_search(client, title, where, size=50, page=p)
+        try:
+            page_hits = await ba_search(client, title, where, size=PAGE_SIZE, page=p)
+        except Exception as e:
+            if p == 1:
+                raise                      # nothing yet: let the caller see the error
+            log.warning("[ba] '%s' page %d failed (%s), keeping earlier pages", title, p, e)
+            break
         hits.extend(page_hits)
-        if len(page_hits) < 50:        # last page
+        if len(page_hits) < PAGE_SIZE:     # last page
             break
     if hits:
         return hits
     for w in re.split(r"[\s/,\-]+", title):
         if len(w) >= 5 and w.lower() != title.lower():
             log.info("[ba] no hits for '%s', retrying with keyword '%s'", title, w)
-            hits = await ba_search(client, w, where, size=50)
+            hits = await ba_search(client, w, where, size=PAGE_SIZE)
             if hits:
                 return hits
     return []
 
-async def find_jobs(titles: list, where, limit: int = 50) -> list:
-    titles = titles[:6]  # limit to 6 titles for speed
+
+async def find_jobs(titles: list, where, limit: int = MAX_JOBS) -> list:
+    titles = titles[:MAX_TITLES]
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         with step(f"BA search for {len(titles)} titles (where={where or 'Germany'})"):
             results = await asyncio.gather(
@@ -160,8 +178,15 @@ async def find_jobs(titles: list, where, limit: int = 50) -> list:
                 base.append(h)
         base = base[:limit]
         log.info("[jobs] %d unique jobs, fetching details", len(base))
+
+        sem = asyncio.Semaphore(DETAIL_CONCURRENCY)
+
+        async def _det(h):
+            async with sem:
+                return await ba_details(client, h["_ref"])
+
         with step(f"fetch details for {len(base)} jobs"):
-            details = await asyncio.gather(*[ba_details(client, h["_ref"]) for h in base])
+            details = await asyncio.gather(*[_det(h) for h in base])
 
     jobs = []
     for h, d in zip(base, details):
@@ -189,7 +214,7 @@ async def find_jobs(titles: list, where, limit: int = 50) -> list:
 
 async def find_jobs_cached(titles: list, where) -> list:
     """Shared 3h cache keyed by location + sorted titles. Also stores jobs for button lookups."""
-    key = f"{where or 'DE'}|{'|'.join(sorted(t.lower() for t in titles[:6]))}"
+    key = f"{CACHE_VERSION}|{where or 'DE'}|{'|'.join(sorted(t.lower() for t in titles[:MAX_TITLES]))}"
     jobs = await db.arun(db.get_cache, key, CACHE_TTL_H)
     if jobs is not None:
         log.info("[jobs] cache hit for %s (%d jobs)", key, len(jobs))
