@@ -9,9 +9,11 @@ from config import TELEGRAM_TOKEN, SCAN_INTERVAL_S, SEND_INTERVAL_S, DIGEST_HOUR
 
 def main():
     app = (Application.builder().token(TELEGRAM_TOKEN)
-           .concurrent_updates(True)          # one slow user must not block the others
-           .post_init(h.setup_bot)            # sets the command list, description and about text
-           .build())
+        .concurrent_updates(True)
+        .connect_timeout(20).read_timeout(30).write_timeout(30).pool_timeout(30)
+        .get_updates_connect_timeout(20).get_updates_read_timeout(40)
+        .post_init(h.setup_bot)
+        .build())
 
     # ---- commands
     app.add_handler(CommandHandler("start", h.start))
@@ -25,7 +27,9 @@ def main():
     app.add_handler(CommandHandler("sender", h.sender_cmd))
     app.add_handler(CommandHandler("stats", h.stats_cmd))
     app.add_handler(CommandHandler("admin", h.admin_cmd))
-    app.add_handler(CommandHandler("sheet", h.sheet_cmd))
+    app.add_handler(CommandHandler("sheet", h.sheet_cmd))# main.py
+    app.add_handler(CommandHandler("run", h.run_cmd))
+    app.add_handler(CallbackQueryHandler(h.on_run, pattern=r"^run:"))
 
     # ---- buttons: every handler has its own pattern, so none of them swallows another's callbacks
     app.add_handler(CallbackQueryHandler(h.on_menu, pattern=r"^menu:"))
@@ -45,7 +49,7 @@ def main():
     app.job_queue.run_daily(autopilot.daily_digest, time=dtime(DIGEST_HOUR, 0, tzinfo=TZ), name="digest")
 
     log.info("Bot started, polling...")
-    app.run_polling()
+    app.run_polling(bootstrap_retries=-1)   
 
 
 if __name__ == "__main__":

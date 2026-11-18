@@ -41,47 +41,63 @@ async def scan_all(ctx: ContextTypes.DEFAULT_TYPE):
             log.exception("[auto] scan failed for user %s", u["tg_id"])
 
 
-async def scan_user(ctx: ContextTypes.DEFAULT_TYPE, u: dict):
+async def scan_user(ctx: ContextTypes.DEFAULT_TYPE, u: dict, immediate: bool = False) -> dict:
     uid, profile = u["tg_id"], u["profile"]
+    st = dict(total=0, known=0, no_email=0, german=0, low_score=0,
+              cooldown=0, letter_failed=0, queued=0, note="")
     if not (db.has_sender(u) or DRY_RUN or ALLOW_SHARED_SENDER):
-        log.info("[auto] user %s: no sender connected, skipping", uid)
-        return
+        st["note"] = "no sender connected"
+        return st
     remaining = u["daily_limit"] - await arun(db.count_auto_today, uid)
     if remaining <= 0:
-        log.info("[auto] user %s: daily limit reached", uid)
-        return
+        st["note"] = "daily limit reached"
+        return st
 
     jobs = await find_jobs_cached(profile.get("job_titles") or [], u.get("location"))
     known = set(await arun(db.known_refnrs, uid))
+    st["total"] = len(jobs)
     cands = []
     for j in jobs:
-        if j["refnr"] in known or not j.get("email") or is_bad_email(j["email"]):
+        if j["refnr"] in known:
+            st["known"] += 1
+            continue
+        if not j.get("email") or is_bad_email(j["email"]):
+            st["no_email"] += 1
             continue
         quick_info(profile, j)
-        if j["german_warning"] or j["score"] < u["min_score"]:
+        if j["german_warning"]:
+            st["german"] += 1
+            continue
+        if j["score"] < u["min_score"]:
+            st["low_score"] += 1
             continue
         cands.append(j)
     cands.sort(key=lambda j: j["score"], reverse=True)
-    log.info("[auto] user %s: %d candidates after filters", uid, len(cands))
+    log.info("[auto] user %s funnel: %s (min_score=%s)", uid, st, u["min_score"])
 
     for job in cands:
         if remaining <= 0:
             break
         if await arun(db.employer_recent, uid, db.employer_key(job["employer"]), EMPLOYER_COOLDOWN_DAYS):
+            st["cooldown"] += 1
             continue
         try:
             letter = await asyncio.to_thread(write_letter_sync, profile, job, u.get("note"))
         except Exception:
             log.exception("[auto] letter failed for %s", job["refnr"])
+            st["letter_failed"] += 1
             continue
-        delay = timedelta(minutes=CANCEL_WINDOW_MIN + random.uniform(0, JITTER_MAX_MIN))
+        delay = timedelta(0) if immediate else timedelta(
+            minutes=CANCEL_WINDOW_MIN + random.uniform(0, JITTER_MAX_MIN))
         send_after = datetime.now(timezone.utc) + delay
         row = await arun(db.insert_queued, uid, job, letter, send_after)
         if not row:
-            continue  # already existed (race with manual apply or another scan)
+            continue
         remaining -= 1
-        sheets.fire(uid, job["refnr"])                       # NEW (row appears as "Queued")
+        st["queued"] += 1
+        sheets.fire(uid, job["refnr"])
         await notify_queued(ctx, uid, job, letter, send_after)
+    return st
 
 async def notify_queued(ctx, uid, job, letter, send_after):
     when = send_after.astimezone(TZ).strftime("%H:%M")
@@ -95,21 +111,45 @@ async def notify_queued(ctx, uid, job, letter, send_after):
     except Exception:
         log.exception("[auto] could not notify user %s", uid)
 
+import smtplib
 
-# ------------------------------------------------------------------ send worker
-async def send_due(ctx: ContextTypes.DEFAULT_TYPE):
-    if not in_work_window():
+RETRY_DELAY_MIN = 15
+MAX_RETRIES = 6                      # ~1.5 h of outage before giving up
+_retries: dict = {}                  # app_id -> attempts (in memory, resets on restart; fine)
+
+
+def is_transient(e: Exception) -> bool:
+    """Network down, DNS, timeout, dropped connection. NOT auth errors or refused recipients."""
+    if isinstance(e, (smtplib.SMTPServerDisconnected, smtplib.SMTPConnectError, TimeoutError)):
+        return True
+    return isinstance(e, OSError) and not isinstance(e, smtplib.SMTPException)
+
+
+async def requeue(row: dict, err) -> bool:
+    when = datetime.now(timezone.utc) + timedelta(minutes=RETRY_DELAY_MIN + random.uniform(0, 5))
+    return await arun(db.set_status, row["tg_id"], row["refnr"], "queued", ["sending"],
+                      error=str(err)[:500], send_after=when.isoformat())
+
+
+async def send_due(ctx: ContextTypes.DEFAULT_TYPE, force: bool = False):
+    if not force and not in_work_window():
         return
-    rows = await arun(db.claim_due, SEND_BATCH)   # queued -> sending, atomic
+    rows = await arun(db.claim_due, SEND_BATCH)
     for i, row in enumerate(rows):
         if i:
             await asyncio.sleep(random.uniform(*SEND_GAP))
-        await send_one(ctx, row)
+        if await send_one(ctx, row) == "transient":
+            # network is down: put the rest of the claimed batch back instead of failing them
+            for rest in rows[i + 1:]:
+                await requeue(rest, "network unavailable, batch postponed")
+            break
 
 
-async def send_one(ctx, row: dict):
+async def send_one(ctx, row: dict) -> str:
+    """Returns 'ok', 'transient' or 'failed'."""
     uid, refnr, app_id = row["tg_id"], row["refnr"], row["id"]
     who = "?"
+    delivered = False
     try:
         user = await arun(db.get_user, uid)
         if not user or not user.get("profile") or not user.get("cv_path"):
@@ -121,21 +161,37 @@ async def send_one(ctx, row: dict):
         job["email"] = row["to_email"]
         sent_to = await asyncio.to_thread(mailer.send, user, job, row["letter"], cv,
                                           Path(user["cv_path"]).suffix)
+        delivered = True                                     # mail is out; never retry after this point
         await arun(db.mark_sent, app_id, row["to_email"])
-        sheets.fire(uid, refnr)                              # NEW (row appears as "Sent")
+        sheets.fire(uid, refnr)
+        _retries.pop(app_id, None)
         extra = " (DRY RUN: sent to yourself)" if DRY_RUN else ""
         msg = f"✅ Auto-sent: {esc(row['title'])} · {esc(row['employer'])}\n→ {esc(sent_to)}{extra}"
+        status = "ok"
     except Exception as e:
+        n = _retries.get(app_id, 0) + 1
+        if not delivered and is_transient(e) and n <= MAX_RETRIES:
+            _retries[app_id] = n
+            log.warning("[auto] transient error for application %s (attempt %d/%d): %r -> requeued",
+                        app_id, n, MAX_RETRIES, e)
+            if await requeue(row, e):
+                return "transient"                           # silent: no user/admin spam
         log.exception("[auto] send failed for application %s", app_id)
-        await arun(db.mark_failed, app_id, str(e))
-        msg = f"⚠️ Auto-send failed: {esc(row['title'])} · {esc(row['employer'])}\n{esc(str(e)[:200])}"
-        await notify_admins(ctx, f"⚠️ <b>Send failed</b> for {esc(who)} ({uid})\n"
-                                 f"{esc(row['title'])} · {esc(row['employer'])}\n{esc(str(e)[:300])}")
+        _retries.pop(app_id, None)
+        if delivered:   # mail went out but DB update failed: don't mark failed (would invite a resend)
+            msg = f"✅ Auto-sent: {esc(row['title'])} · {esc(row['employer'])}"
+            status = "ok"
+        else:
+            await arun(db.mark_failed, app_id, str(e))
+            msg = f"⚠️ Auto-send failed: {esc(row['title'])} · {esc(row['employer'])}\n{esc(str(e)[:200])}"
+            await notify_admins(ctx, f"⚠️ <b>Send failed</b> for {esc(who)} ({uid})\n"
+                                     f"{esc(row['title'])} · {esc(row['employer'])}\n{esc(str(e)[:300])}")
+            status = "failed"
     try:
         await ctx.bot.send_message(uid, msg, parse_mode="HTML")
     except Exception:
         log.warning("[auto] could not notify user %s", uid)
-
+    return status
 
 # ------------------------------------------------------------------ admin digest
 def fmt_stats_line(r: dict) -> str:

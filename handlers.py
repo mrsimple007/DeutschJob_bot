@@ -13,7 +13,7 @@ from matching import quick_info
 from autopilot import fmt_stats_line
 from config import (MAX_SHOW, DRY_RUN, ALLOW_SHARED_SENDER, ADMIN_IDS, EMAIL_RE,
                     CANCEL_WINDOW_MIN, WORK_START, WORK_END, log, step)
-
+import autopilot
 DONE_STATES = ("sent", "queued", "sending", "applied_manual")
 STATUS_ICON = {"draft": "📝", "queued": "⏳", "sending": "📤", "sent": "✅", "failed": "⚠️",
                "cancelled": "✖", "applied_manual": "✅"}
@@ -36,13 +36,23 @@ def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
 
 
+from telegram.error import NetworkError, TimedOut
+
+async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
+    err = ctx.error
+    if isinstance(err, (NetworkError, TimedOut)):   # BadGateway is a NetworkError
+        log.warning("[tg] transient network error: %s", err)
+        return
+    log.error("Unhandled error", exc_info=err)
+
 def main_menu(uid: int) -> InlineKeyboardMarkup:
     rows = [
         [B("🔎 Search jobs", callback_data="menu:search"), B("👤 Profile", callback_data="menu:profile")],
         [B("📧 Email sender", callback_data="menu:sender"), B("🤖 Auto mode", callback_data="menu:auto")],
         [B("📍 Location", callback_data="menu:location"), B("📊 Stats", callback_data="menu:stats")],
         [B("🕘 History", callback_data="menu:history"), B("📝 Note", callback_data="menu:note")],
-        [B("🗑 Delete my data", callback_data="menu:delete")],
+
+        [B("⚡ Run now", callback_data="menu:run"), B("🗑 Delete my data", callback_data="menu:delete")],
     ]
     if is_admin(uid):
         rows.append([B("👥 Clients", callback_data="adm:open"), B("📊 Sheet", callback_data="adm:sheet")])
@@ -82,6 +92,7 @@ PUBLIC_COMMANDS = [
     BotCommand("stats", "Your application numbers"),
     BotCommand("history", "Your recent applications"),
     BotCommand("note", "Add context for your letters"),
+    BotCommand("run", "Run a scan and send applications immediately"),
     BotCommand("delete", "Delete all your data"),
 ]
 ADMIN_COMMANDS = PUBLIC_COMMANDS + [
@@ -94,6 +105,49 @@ DESCRIPTION = ("I help you apply for jobs in Germany. Send your CV (PDF or DOCX)
                "Your CV is processed by Google's Gemini API.")
 ABOUT = "Job search in Germany: CV → matched jobs → AI cover letters → sent from your own email."
 
+
+
+async def run_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    user = await arun(db.get_user, uid)
+    if not user or not user.get("profile") or not user.get("cv_path"):
+        await update.effective_message.reply_text("Send your CV first.")
+        return
+    if not sender_ok(user):
+        await update.effective_message.reply_text("Connect your email first with /sender.")
+        return
+    kb = InlineKeyboardMarkup([[B("⚡ Yes, scan and send now", callback_data="run:yes"),
+                                B("Cancel", callback_data="run:no")]])
+    await update.effective_message.reply_text(
+        f"This scans now and sends up to {user['daily_limit']} real applications within a minute or two, "
+        "ignoring the cancel window and work hours. Your daily limit and min score still apply.",
+        reply_markup=kb)
+
+
+async def on_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await clear_kb(q)
+    if q.data != "run:yes":
+        return
+    uid = q.from_user.id
+    user = await arun(db.get_user, uid)
+    if not user or not user.get("profile"):
+        return
+    msg = await q.message.reply_text("⚡ Scanning...")
+    try:
+        st = await autopilot.scan_user(ctx, user, immediate=True)
+    except Exception as e:
+        log.exception("[run] scan failed")
+        await msg.edit_text(f"Scan failed: {e}")
+        return
+    await msg.edit_text(
+        f"Jobs found: {st['total']}\n"
+        f"Already seen: {st['known']} · no email: {st['no_email']} · German required: {st['german']}\n"
+        f"Score below {user['min_score']}: {st['low_score']} · employer cooldown: {st['cooldown']}\n"
+        f"✅ Queued: {st['queued']}" + (f"\nℹ️ {st['note']}" if st["note"] else ""))
+    if st["queued"]:
+        await autopilot.send_due(ctx, force=True)
 
 async def setup_bot(app):
     """Run once at startup (post_init): sets the command list, description and about text."""
@@ -187,7 +241,7 @@ async def on_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     actions = {"search": search_cmd, "profile": profile_cmd, "sender": sender_cmd, "auto": auto_cmd,
                "location": location_cmd, "stats": stats_cmd, "history": history_cmd,
-               "note": note_cmd, "delete": delete_cmd}
+               "note": note_cmd, "delete": delete_cmd, "run": run_cmd,}
     fn = actions.get(q.data.split(":", 1)[1])
     if fn:
         ctx.args = []
