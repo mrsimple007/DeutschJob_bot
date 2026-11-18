@@ -64,15 +64,10 @@ async def scan_user(ctx: ContextTypes.DEFAULT_TYPE, u: dict, immediate: bool = F
         if not j.get("email") or is_bad_email(j["email"]):
             st["no_email"] += 1
             continue
-        quick_info(profile, j)
-        if j["german_warning"]:
-            st["german"] += 1
-            continue
-        if j["score"] < u["min_score"]:
-            st["low_score"] += 1
-            continue
+        quick_info(profile, j)          # only used for sorting
         cands.append(j)
     cands.sort(key=lambda j: j["score"], reverse=True)
+
     log.info("[auto] user %s funnel: %s (min_score=%s)", uid, st, u["min_score"])
 
     for job in cands:

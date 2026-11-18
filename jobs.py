@@ -117,21 +117,25 @@ def clean_html(s: str) -> str:
     return re.sub(r"\s+", " ", html.unescape(s)).strip()
 
 
-async def search_with_fallback(client, title: str, where):
-    hits = await ba_search(client, title, where)
+async def search_with_fallback(client, title: str, where, pages: int = 3):
+    hits = []
+    for p in range(1, pages + 1):
+        page_hits = await ba_search(client, title, where, size=50, page=p)
+        hits.extend(page_hits)
+        if len(page_hits) < 50:        # last page
+            break
     if hits:
         return hits
     for w in re.split(r"[\s/,\-]+", title):
         if len(w) >= 5 and w.lower() != title.lower():
             log.info("[ba] no hits for '%s', retrying with keyword '%s'", title, w)
-            hits = await ba_search(client, w, where)
+            hits = await ba_search(client, w, where, size=50)
             if hits:
                 return hits
     return []
 
-
-async def find_jobs(titles: list, where, limit: int = 25) -> list:
-    titles = titles[:4]
+async def find_jobs(titles: list, where, limit: int = 50) -> list:
+    titles = titles[:6]  # limit to 6 titles for speed
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         with step(f"BA search for {len(titles)} titles (where={where or 'Germany'})"):
             results = await asyncio.gather(
@@ -185,7 +189,7 @@ async def find_jobs(titles: list, where, limit: int = 25) -> list:
 
 async def find_jobs_cached(titles: list, where) -> list:
     """Shared 3h cache keyed by location + sorted titles. Also stores jobs for button lookups."""
-    key = f"{where or 'DE'}|{'|'.join(sorted(t.lower() for t in titles[:4]))}"
+    key = f"{where or 'DE'}|{'|'.join(sorted(t.lower() for t in titles[:6]))}"
     jobs = await db.arun(db.get_cache, key, CACHE_TTL_H)
     if jobs is not None:
         log.info("[jobs] cache hit for %s (%d jobs)", key, len(jobs))

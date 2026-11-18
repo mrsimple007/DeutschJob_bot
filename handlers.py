@@ -147,8 +147,11 @@ async def on_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Score below {user['min_score']}: {st['low_score']} · employer cooldown: {st['cooldown']}\n"
         f"✅ Queued: {st['queued']}" + (f"\nℹ️ {st['note']}" if st["note"] else ""))
     if st["queued"]:
-        await autopilot.send_due(ctx, force=True)
+        from config import SEND_BATCH
+        for _ in range(-(-st["queued"] // SEND_BATCH)):    # ceil
+            await autopilot.send_due(ctx, force=True)
 
+            
 async def setup_bot(app):
     """Run once at startup (post_init): sets the command list, description and about text."""
     bot = app.bot
