@@ -3,7 +3,7 @@ Mails come from the client's address, land in their Sent folder, and replies go 
 Keep send() stable so a Gmail-OAuth or transactional backend can replace it later."""
 import smtplib, ssl
 from email.message import EmailMessage
-from email.utils import formataddr
+from email.utils import formataddr, make_msgid
 from typing import Optional
 
 import crypto
@@ -63,8 +63,9 @@ def _deliver(sender: dict, msg: EmailMessage) -> None:
         s.send_message(msg)
 
 
-def send(user: dict, job: dict, letter: dict, cv_bytes: bytes, cv_ext: str) -> str:
-    """Blocking. `user` is the deutschjob_users row. Returns the address actually mailed."""
+def send(user: dict, job: dict, letter: dict, cv_bytes: bytes, cv_ext: str) -> tuple:
+    """Blocking. `user` is the deutschjob_users row.
+    Returns (address actually mailed, Message-ID) - the Message-ID lets reply tracking match replies."""
     profile = user.get("profile") or {}
     sender = _resolve_sender(user)
     if not DRY_RUN and (not job.get("email") or is_bad_email(job["email"])):
@@ -76,8 +77,10 @@ def send(user: dict, job: dict, letter: dict, cv_bytes: bytes, cv_ext: str) -> s
     msg = EmailMessage()
     msg["From"] = formataddr((sender["name"] or profile.get("full_name") or "", sender["user"]))
     msg["To"] = to_addr
+    msg["Message-ID"] = make_msgid(domain=sender["user"].rsplit("@", 1)[-1])
     cv_mail = (profile.get("email") or "").strip()
-    if cv_mail and cv_mail.lower() != sender["user"].lower():
+    # with reply tracking on, replies must land in the tracked (sender) mailbox, so no Reply-To
+    if cv_mail and cv_mail.lower() != sender["user"].lower() and not user.get("track_replies"):
         msg["Reply-To"] = cv_mail
     msg["Subject"] = ("[TEST] " if DRY_RUN else "") + letter["subject"]
     msg.set_content(letter["body"])
@@ -88,7 +91,7 @@ def send(user: dict, job: dict, letter: dict, cv_bytes: bytes, cv_ext: str) -> s
                        filename=f"Lebenslauf_{name}{cv_ext}")
     _deliver(sender, msg)
     log.info("[mail] sent OK")
-    return to_addr
+    return to_addr, msg["Message-ID"]
 
 
 def send_test(user: dict) -> str:

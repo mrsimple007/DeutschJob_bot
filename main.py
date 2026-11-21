@@ -4,7 +4,9 @@ from telegram.ext import (Application, CommandHandler, MessageHandler,
 
 import handlers as h
 import autopilot
-from config import TELEGRAM_TOKEN, SCAN_INTERVAL_S, SEND_INTERVAL_S, DIGEST_HOUR, TZ, log
+import replies
+from config import (TELEGRAM_TOKEN, SCAN_INTERVAL_S, SEND_INTERVAL_S, DIGEST_HOUR, TZ,
+                    REPLY_CHECK_INTERVAL_S, log)
 
 
 def main():
@@ -29,6 +31,8 @@ def main():
     app.add_handler(CommandHandler("admin", h.admin_cmd))
     app.add_handler(CommandHandler("sheet", h.sheet_cmd))# main.py
     app.add_handler(CommandHandler("run", h.run_cmd))
+    app.add_handler(CommandHandler("replies", h.replies_cmd))
+    app.add_handler(CallbackQueryHandler(h.on_replies, pattern=r"^replies:"))
     app.add_handler(CallbackQueryHandler(h.on_run, pattern=r"^run:"))
 
     # ---- buttons: every handler has its own pattern, so none of them swallows another's callbacks
@@ -46,6 +50,8 @@ def main():
     # ---- scheduled jobs
     app.job_queue.run_repeating(autopilot.scan_all, interval=SCAN_INTERVAL_S, first=60, name="scan_all")
     app.job_queue.run_repeating(autopilot.send_due, interval=SEND_INTERVAL_S, first=30, name="send_due")
+    app.job_queue.run_repeating(replies.check_all, interval=REPLY_CHECK_INTERVAL_S, first=120,
+                                name="check_replies")
     app.job_queue.run_daily(autopilot.daily_digest, time=dtime(DIGEST_HOUR, 0, tzinfo=TZ), name="digest")
 
     log.info("Bot started, polling...")

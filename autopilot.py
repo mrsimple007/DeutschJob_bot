@@ -55,13 +55,14 @@ async def scan_user(ctx: ContextTypes.DEFAULT_TYPE, u: dict, immediate: bool = F
 
     jobs = await find_jobs_cached(profile.get("job_titles") or [], u.get("location"))
     known = set(await arun(db.known_refnrs, uid))
+    bounced = await arun(db.bad_emails)              # addresses that bounced before (reply tracking)
     st["total"] = len(jobs)
     cands = []
     for j in jobs:
         if j["refnr"] in known:
             st["known"] += 1
             continue
-        if not j.get("email") or is_bad_email(j["email"]):
+        if not j.get("email") or is_bad_email(j["email"]) or j["email"].lower() in bounced:
             st["no_email"] += 1
             continue
         quick_info(profile, j)          # only used for sorting
@@ -173,10 +174,10 @@ async def send_one(ctx, row: dict) -> str:
         job = (await arun(db.get_job, refnr)) or {"refnr": refnr, "title": row["title"],
                                                   "employer": row["employer"]}
         job["email"] = row["to_email"]
-        sent_to = await asyncio.to_thread(mailer.send, user, job, row["letter"], cv,
-                                          Path(user["cv_path"]).suffix)
+        sent_to, msg_id = await asyncio.to_thread(mailer.send, user, job, row["letter"], cv,
+                                                  Path(user["cv_path"]).suffix)
         delivered = True                                     # mail is out; never retry after this point
-        await arun(db.mark_sent, app_id, row["to_email"])
+        await arun(db.mark_sent, app_id, row["to_email"], msg_id)
         sheets.fire(uid, refnr)
         _retries.pop(app_id, None)
         extra = " (DRY RUN: sent to yourself)" if DRY_RUN else ""
@@ -213,7 +214,9 @@ def fmt_stats_line(r: dict) -> str:
     return (f"👤 <b>{esc(r.get('name') or r['tg_id'])}</b> ({r['tg_id']}) · auto {'ON' if r['auto_on'] else 'off'}\n"
             f"   sender: {esc(r.get('sender') or 'none')}\n"
             f"   today {r['sent_today']} · total {r['sent_total']} · queued {r['queued']} · "
-            f"failed {r['failed']} · web {r['web_applied']} · last {last}")
+            f"failed {r['failed']} · web {r['web_applied']} · last {last}\n"
+            f"   🎉 interviews {r.get('interviews') or 0} · ❌ rejections {r.get('rejections') or 0} · "
+            f"⚠️ bounced {r.get('bounced') or 0}")
 
 
 async def daily_digest(ctx: ContextTypes.DEFAULT_TYPE):

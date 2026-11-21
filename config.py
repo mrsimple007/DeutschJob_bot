@@ -81,3 +81,7 @@ ADMIN_IDS = {int(x) for x in re.split(r"[,\s;]+", os.getenv("ADMIN_IDS", "")) if
 # Shared sender (SMTP_USER above) is used only in DRY_RUN, or if you explicitly allow it.
 ALLOW_SHARED_SENDER = os.getenv("ALLOW_SHARED_SENDER", "0") == "1"
 DIGEST_HOUR = 18   # daily admin summary, Berlin time
+# ------------------------------------------------------------------ reply tracking (IMAP)
+REPLY_CHECK_INTERVAL_S = 30 * 60      # check opted-in inboxes every 30 minutes
+REPLY_LOOKBACK_DAYS = 60              # only match replies to applications sent in this window
+REPLY_MAX_SCAN = 300                  # newest inbox messages scanned (headers only) per check

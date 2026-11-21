@@ -12,13 +12,14 @@ from config import GOOGLE_SA_FILE, MASTER_SHEET_ID, TZ, log
 BASE = Path(__file__).resolve().parent
 HEADERS = ["Applied (Berlin)", "Job title", "Employer", "Email", "Job link",
            "Status", "Mode", "Outcome", "Notes", "Ref"]
-OUTCOMES = ["Waiting", "Interview", "Approved", "Rejected", "No response"]
+OUTCOMES = ["Waiting", "Interview", "Approved", "Rejected", "No response", "Bounced"]
 COLORS = {                      # RGB 0-1
     "Waiting":     (1.00, 0.95, 0.60),   # yellow
     "Interview":   (0.72, 0.88, 0.72),   # green
     "Approved":    (0.45, 0.78, 0.50),   # stronger green
     "Rejected":    (0.96, 0.68, 0.68),   # red
     "No response": (0.85, 0.85, 0.85),   # grey
+    "Bounced":     (0.80, 0.60, 0.85),   # purple
 }
 REF_COL = len(HEADERS)            # column J, hidden, used to find the row
 LABEL = {"queued": "Queued", "sending": "Sending", "sent": "Sent", "failed": "Failed",
@@ -242,13 +243,62 @@ async def sync_app(uid: int, refnr: str) -> None:
         log.warning("[sheets] sync failed for user %s job %s", uid, refnr, exc_info=True)
 
 
-def fire(uid: int, refnr: str) -> None:
-    """Fire-and-forget from async code, so Telegram replies and sending never wait for Google."""
-    if not enabled():
-        return
-    t = asyncio.get_running_loop().create_task(sync_app(uid, refnr))
+def _spawn(coro) -> None:
+    t = asyncio.get_running_loop().create_task(coro)
     _tasks.add(t)
     t.add_done_callback(_tasks.discard)
+
+
+def fire(uid: int, refnr: str) -> None:
+    """Fire-and-forget from async code, so Telegram replies and sending never wait for Google."""
+    if enabled():
+        _spawn(sync_app(uid, refnr))
+
+
+# ------------------------------------------------------------------ outcome from reply tracking
+KEEP_OUTCOMES = ("Approved",)       # set by the client by hand: never overwritten automatically
+
+
+def _set_outcome(uid: int, refnr: str, label, note) -> None:
+    """Writes Outcome (H) unless the client set a final value, and Notes (I) only if it is empty."""
+    if not enabled():
+        return
+    _sync_app(uid, refnr)                        # make sure the row exists and columns A-G are current
+    user, app = db.get_user(uid), db.get_app(uid, refnr)
+    if not user or not app:
+        return
+    with _lock:
+        try:
+            ws = _ensure_tab(_stamp(app, user))
+            refs = ws.col_values(REF_COL)
+            if refnr not in refs:
+                return
+            r = refs.index(refnr) + 1
+            cur = (ws.get(f"H{r}:I{r}") or [[]])[0]
+            cur_h = cur[0] if len(cur) > 0 else ""
+            cur_i = cur[1] if len(cur) > 1 else ""
+            updates = []
+            if label and cur_h != label and cur_h not in KEEP_OUTCOMES:
+                updates.append({"range": f"H{r}", "values": [[label]]})
+            if note and not cur_i:
+                updates.append({"range": f"I{r}", "values": [[_safe(note)]]})
+            if updates:
+                ws.batch_update(updates, value_input_option="RAW")
+        except Exception:
+            _tabs.clear()
+            raise
+
+
+async def _outcome_task(uid, refnr, label, note):
+    try:
+        await asyncio.to_thread(_set_outcome, uid, refnr, label, note)
+    except Exception:
+        log.warning("[sheets] outcome update failed for user %s job %s", uid, refnr, exc_info=True)
+
+
+def fire_outcome(uid: int, refnr: str, label, note) -> None:
+    if enabled():
+        _spawn(_outcome_task(uid, refnr, label, note))
 
 
 log.info("[sheets] enabled=%s file=%s master=%s", enabled(), _sa_path(), MASTER_SHEET_ID or "-")

@@ -136,3 +136,64 @@ notify pgrst, 'reload schema';
 alter table deutschjob_users drop constraint if exists deutschjob_users_daily_limit_check;
 alter table deutschjob_users add constraint deutschjob_users_daily_limit_check
   check (daily_limit between 1 and 30);
+-- 5. Reply tracking (IMAP): opt-in per user, outcome per application, processed-message log
+alter table deutschjob_users
+  add column if not exists track_replies   boolean not null default false,
+  add column if not exists imap_host       text,          -- null = derived from smtp_host
+  add column if not exists imap_checked_at timestamptz,
+  add column if not exists imap_error      text;
+
+alter table deutschjob_applications
+  add column if not exists message_id    text,            -- Message-ID of the sent mail
+  add column if not exists outcome       text check (outcome in
+                 ('acknowledged','interview','rejected','other','bounced')),
+  add column if not exists reply_at      timestamptz,
+  add column if not exists reply_summary text;
+
+create table if not exists deutschjob_replies (
+  tg_id       bigint not null references deutschjob_users(tg_id) on delete cascade,
+  message_id  text not null,
+  app_id      bigint references deutschjob_applications(id) on delete cascade,
+  category    text not null,
+  received_at timestamptz,
+  created_at  timestamptz not null default now(),
+  primary key (tg_id, message_id)
+);
+
+-- Addresses that bounced: auto mode never sends to them again
+create table if not exists deutschjob_bad_emails (
+  email      text primary key,
+  reason     text,
+  created_at timestamptz not null default now()
+);
+
+alter table deutschjob_replies    enable row level security;
+alter table deutschjob_bad_emails enable row level security;
+
+-- Stats view with reply outcomes
+drop view if exists deutschjob_client_stats;
+create view deutschjob_client_stats as
+select
+  u.tg_id,
+  u.profile->>'full_name'  as name,
+  u.smtp_user              as sender,
+  u.auto_on,
+  count(*) filter (where a.status = 'sent'
+        and a.sent_at >= date_trunc('day', now() at time zone 'Europe/Berlin')
+                         at time zone 'Europe/Berlin')   as sent_today,
+  count(*) filter (where a.status = 'sent')              as sent_total,
+  count(*) filter (where a.status = 'queued')            as queued,
+  count(*) filter (where a.status = 'failed')            as failed,
+  count(*) filter (where a.status = 'applied_manual')    as web_applied,
+  count(*) filter (where a.outcome = 'interview')        as interviews,
+  count(*) filter (where a.outcome = 'rejected')         as rejections,
+  count(*) filter (where a.outcome = 'bounced')          as bounced,
+  max(a.sent_at)                                         as last_sent
+from deutschjob_users u
+left join deutschjob_applications a on a.tg_id = u.tg_id
+group by u.tg_id;
+
+alter view deutschjob_client_stats set (security_invoker = on);
+revoke all on deutschjob_client_stats from anon, authenticated;
+
+notify pgrst, 'reload schema';

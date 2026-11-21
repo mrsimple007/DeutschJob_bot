@@ -152,9 +152,9 @@ def claim_due(batch: int) -> list:
     return sb.rpc("deutschjob_claim_due", {"batch": batch}).execute().data or []
 
 
-def mark_sent(app_id: int, to_email: str) -> None:
+def mark_sent(app_id: int, to_email: str, message_id: Optional[str] = None) -> None:
     (sb.table(T_APPS).update({"status": "sent", "sent_at": now_iso(), "error": None,
-                              "to_email": to_email, "updated_at": now_iso()})
+                              "to_email": to_email, "message_id": message_id, "updated_at": now_iso()})
      .eq("id", app_id).execute())
 
 
@@ -164,7 +164,7 @@ def mark_failed(app_id: int, error: str) -> None:
 
 
 def history(tg_id: int, limit: int = 10) -> list:
-    r = (sb.table(T_APPS).select("title,employer,status,mode,created_at,sent_at,to_email,error")
+    r = (sb.table(T_APPS).select("title,employer,status,mode,created_at,sent_at,to_email,error,outcome")
          .eq("tg_id", tg_id)
          .neq("status", "skipped").order("created_at", desc=True).limit(limit).execute())
     return r.data
@@ -191,3 +191,48 @@ def client_stats(tg_id: Optional[int] = None) -> list:
     if tg_id is not None:
         q = q.eq("tg_id", tg_id)
     return q.execute().data
+
+# ------------------------------------------------------------------ reply tracking
+T_REPLIES = "deutschjob_replies"
+T_BAD = "deutschjob_bad_emails"
+
+
+def list_reply_users() -> list:
+    r = sb.table(T_USERS).select("*").eq("track_replies", True).execute()
+    return [u for u in r.data if has_sender(u)]
+
+
+def sent_apps_since(tg_id: int, since_iso: str) -> list:
+    r = (sb.table(T_APPS).select("id,refnr,title,employer,to_email,message_id,sent_at,outcome")
+         .eq("tg_id", tg_id).eq("status", "sent").gte("sent_at", since_iso)
+         .order("sent_at").limit(2000).execute())
+    return r.data
+
+
+def seen_message_ids(tg_id: int) -> list:
+    r = sb.table(T_REPLIES).select("message_id").eq("tg_id", tg_id).limit(10000).execute()
+    return [x["message_id"] for x in r.data]
+
+
+def add_reply(tg_id: int, message_id: str, app_id: Optional[int], category: str,
+              received_at: Optional[str]) -> bool:
+    """Records a processed inbox message. Returns False if it was already recorded (dedupe gate)."""
+    row = {"tg_id": tg_id, "message_id": message_id, "app_id": app_id,
+           "category": category, "received_at": received_at}
+    r = sb.table(T_REPLIES).upsert(row, on_conflict="tg_id,message_id", ignore_duplicates=True).execute()
+    return bool(r.data)
+
+
+def set_outcome(app_id: int, outcome: str, summary: Optional[str], reply_at: Optional[str]) -> None:
+    (sb.table(T_APPS).update({"outcome": outcome, "reply_summary": (summary or "")[:500],
+                              "reply_at": reply_at or now_iso(), "updated_at": now_iso()})
+     .eq("id", app_id).execute())
+
+
+def add_bad_email(addr: str, reason: str) -> None:
+    sb.table(T_BAD).upsert({"email": addr.lower(), "reason": reason[:200]}, on_conflict="email").execute()
+
+
+def bad_emails() -> set:
+    r = sb.table(T_BAD).select("email").limit(50000).execute()
+    return {x["email"] for x in r.data}

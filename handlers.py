@@ -14,9 +14,11 @@ from autopilot import fmt_stats_line
 from config import (MAX_SHOW, DRY_RUN, ALLOW_SHARED_SENDER, ADMIN_IDS, EMAIL_RE,
                     CANCEL_WINDOW_MIN, WORK_START, WORK_END, log, step)
 import autopilot
+import replies
 DONE_STATES = ("sent", "queued", "sending", "applied_manual")
 STATUS_ICON = {"draft": "📝", "queued": "⏳", "sending": "📤", "sent": "✅", "failed": "⚠️",
                "cancelled": "✖", "applied_manual": "✅"}
+OUTCOME_ICON = {"interview": "🎉", "rejected": "❌", "acknowledged": "📨", "other": "✉️", "bounced": "⚠️"}
 import math
 from telegram import BotCommand, BotCommandScopeChat
 
@@ -52,7 +54,8 @@ def main_menu(uid: int) -> InlineKeyboardMarkup:
         [B("📍 Location", callback_data="menu:location"), B("📊 Stats", callback_data="menu:stats")],
         [B("🕘 History", callback_data="menu:history"), B("📝 Note", callback_data="menu:note")],
 
-        [B("⚡ Run now", callback_data="menu:run"), B("🗑 Delete my data", callback_data="menu:delete")],
+        [B("📬 Replies", callback_data="menu:replies"), B("⚡ Run now", callback_data="menu:run")],
+        [B("🗑 Delete my data", callback_data="menu:delete")],
     ]
     if is_admin(uid):
         rows.append([B("👥 Clients", callback_data="adm:open"), B("📊 Sheet", callback_data="adm:sheet")])
@@ -93,6 +96,7 @@ PUBLIC_COMMANDS = [
     BotCommand("history", "Your recent applications"),
     BotCommand("note", "Add context for your letters"),
     BotCommand("run", "Run a scan and send applications immediately"),
+    BotCommand("replies", "Track employer replies in your inbox"),
     BotCommand("delete", "Delete all your data"),
 ]
 ADMIN_COMMANDS = PUBLIC_COMMANDS + [
@@ -243,7 +247,7 @@ async def on_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     actions = {"search": search_cmd, "profile": profile_cmd, "sender": sender_cmd, "auto": auto_cmd,
                "location": location_cmd, "stats": stats_cmd, "history": history_cmd,
-               "note": note_cmd, "delete": delete_cmd, "run": run_cmd,}
+               "note": note_cmd, "delete": delete_cmd, "run": run_cmd, "replies": replies_cmd}
     fn = actions.get(q.data.split(":", 1)[1])
     if fn:
         ctx.args = []
@@ -287,7 +291,9 @@ async def history_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("No applications yet.")
         return
     lines = [f"{STATUS_ICON.get(r['status'], '•')} {esc(r['title'])} · {esc(r['employer'])} "
-             f"<i>({r['status']}{', auto' if r['mode'] == 'auto' else ''})</i>" for r in rows]
+             f"<i>({r['status']}{', auto' if r['mode'] == 'auto' else ''})</i>"
+             + (f" {OUTCOME_ICON.get(r.get('outcome'), '')} {r['outcome']}" if r.get("outcome") else "")
+             for r in rows]
     await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
@@ -393,6 +399,98 @@ async def sheet_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/sheet sync - rebuild your rows\n/sheet name@gmail.com - share the sheet")
 
     
+# ------------------------------------------------------------------ reply tracking
+HOST_RE = re.compile(r"^[a-z0-9.-]+\.[a-z]{2,}$")
+
+
+def _replies_summary(st: dict) -> str:
+    if st.get("error"):
+        return f"⚠️ Check failed: {st['error']}"
+    if not st["apps"]:
+        return "No sent applications in the last 60 days, nothing to match yet."
+    if not st["new"]:
+        return f"No new replies (watching {st['apps']} sent application(s))."
+    parts = [f"{OUTCOME_ICON[k]} {k}: {st[k]}" for k in OUTCOME_ICON if st.get(k)]
+    return f"📬 {st['new']} new repl{'y' if st['new'] == 1 else 'ies'}: " + ", ".join(parts)
+
+
+async def replies_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    say = update.effective_message.reply_text
+    user = await arun(db.get_user, uid)
+    args = ctx.args or []
+    sub = args[0].lower() if args else ""
+    if not db.has_sender(user):
+        await say("Connect your own email first with /sender. Replies are read from that mailbox.")
+        return
+    host = replies.imap_host_for(user)
+
+    if sub == "on":
+        try:
+            await asyncio.to_thread(replies.verify_imap, host, user["smtp_user"],
+                                    crypto.decrypt(user["smtp_pass_enc"]))
+        except Exception as e:
+            log.warning("[replies] IMAP verify failed for user %s: %s", uid, type(e).__name__)
+            await say(f"❌ Could not log in to {host} ({type(e).__name__}).\n"
+                      "GMX / web.de: enable IMAP in the mailbox settings first.\n"
+                      "Other provider: /replies imap imap.example.de")
+            return
+        await arun(db.update_user, uid, track_replies=True, imap_error=None)
+        msg = await say("📬 Reply tracking ON. Checking your inbox now...")
+        user["track_replies"] = True
+        st = await replies.check_user(ctx, user, notify_login_error=False)
+        await msg.edit_text("📬 Reply tracking ON. I check your inbox every 30 minutes.\n\n"
+                            + _replies_summary(st))
+        return
+    if sub == "off":
+        await arun(db.update_user, uid, track_replies=False)
+        await say("Reply tracking OFF. I no longer read your inbox.")
+        return
+    if sub == "check":
+        if not user.get("track_replies"):
+            await say("Reply tracking is off. Turn it on with /replies on")
+            return
+        msg = await say("📬 Checking your inbox...")
+        st = await replies.check_user(ctx, user, notify_login_error=False)
+        await msg.edit_text(_replies_summary(st))
+        return
+    if sub == "imap" and len(args) > 1:
+        new_host = args[1].strip().lower()
+        if not HOST_RE.fullmatch(new_host):
+            await say("Usage: /replies imap imap.example.de")
+            return
+        await arun(db.update_user, uid, imap_host=new_host)
+        await say(f"IMAP server set to {new_host}. Now turn tracking on with /replies on")
+        return
+
+    on = bool(user.get("track_replies"))
+    checked = str(user.get("imap_checked_at") or "")[:16].replace("T", " ") or "never"
+    text = (f"📬 Reply tracking: {'ON' if on else 'OFF'}\n"
+            f"Mailbox: {user['smtp_user']} (IMAP {host})\n"
+            + (f"Last check: {checked} UTC\n" if on else "")
+            + (f"⚠️ Last error: {user['imap_error']}\n" if user.get("imap_error") else "")
+            + "\nWhen ON, I look at the sender and subject of new mails in this inbox (read-only: "
+              "nothing is marked, moved or deleted). Only replies that match one of your applications "
+              "are opened and summarized with Google's Gemini. You get a message for interviews, "
+              "rejections and bounced addresses, and your sheet's Outcome column updates itself.")
+    cv_mail = ((user.get("profile") or {}).get("email") or "").strip().lower()
+    if cv_mail and cv_mail != user["smtp_user"].lower():
+        text += (f"\n\nℹ️ Your CV lists {cv_mail}. With tracking ON, new applications ask employers "
+                 f"to reply to {user['smtp_user']} instead, so I can see the replies.")
+    text += "\n\nOther IMAP server: /replies imap imap.example.de"
+    kb = ([[B("🔴 Turn OFF", callback_data="replies:off"), B("🔄 Check now", callback_data="replies:check")]]
+          if on else [[B("🟢 Turn ON", callback_data="replies:on")]])
+    await say(text, reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def on_replies(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await clear_kb(q)
+    ctx.args = [q.data.split(":", 1)[1]]
+    await replies_cmd(update, ctx)
+
+
 # ------------------------------------------------------------------ stats / admin
 async def stats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rows = await arun(db.client_stats, update.effective_user.id)
@@ -402,7 +500,9 @@ async def stats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     r = rows[0]
     await update.effective_message.reply_text(
         f"📊 Sent today: {r['sent_today']}\nSent total: {r['sent_total']}\nQueued: {r['queued']}\n"
-        f"Failed: {r['failed']}\nWebsite applications (marked): {r['web_applied']}")
+        f"Failed: {r['failed']}\nWebsite applications (marked): {r['web_applied']}\n"
+        f"🎉 Interviews: {r.get('interviews') or 0} · ❌ Rejections: {r.get('rejections') or 0} · "
+        f"⚠️ Bounced: {r.get('bounced') or 0}")
 
 
 async def _admin_list(page: int):
@@ -798,15 +898,15 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             with step(f"send application {refnr}"):
                 cv = await asyncio.to_thread(storage.download_cv, user["cv_path"])
-                sent_to = await asyncio.to_thread(mailer.send, user, job, app["letter"], cv,
-                                                  Path(user["cv_path"]).suffix)
+                sent_to, msg_id = await asyncio.to_thread(mailer.send, user, job, app["letter"], cv,
+                                                          Path(user["cv_path"]).suffix)
         except Exception as e:
             log.exception("send failed")
             await arun(db.set_status, uid, refnr, "draft", ["sending"], error=str(e)[:500])
             await q.message.reply_text(f"Sending failed: {e}")
             return
         await arun(db.set_status, uid, refnr, "sent", ["sending"],
-                   sent_at=now_iso(), error=None, to_email=job["email"])
+                   sent_at=now_iso(), error=None, to_email=job["email"], message_id=msg_id)
         await clear_kb(q)
         note = " (DRY RUN: sent to yourself)" if DRY_RUN else ""
         await q.message.reply_text(f"✅ Application sent to {sent_to}{note}")
