@@ -197,3 +197,8 @@ alter view deutschjob_client_stats set (security_invoker = on);
 revoke all on deutschjob_client_stats from anon, authenticated;
 
 notify pgrst, 'reload schema';
+
+-- 6. Extra attachments (certificates, references) sent with every application: [{id,name,key,size,mime}]
+alter table deutschjob_users
+  add column if not exists attachments jsonb not null default '[]'::jsonb;
+notify pgrst, 'reload schema';

@@ -1,12 +1,11 @@
 """Auto mode: scheduled scan (find -> filter -> letter -> queue), send worker, admin digest."""
 import asyncio, html, random
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 import sheets
-import db, mailer, storage
+import db, mailer
 from db import arun
 from jobs import find_jobs_cached, is_bad_email
 from llm import write_letter_sync
@@ -170,12 +169,11 @@ async def send_one(ctx, row: dict) -> str:
         if not user or not user.get("profile") or not user.get("cv_path"):
             raise RuntimeError("user, profile or CV missing")
         who = (user["profile"].get("full_name") or str(uid))
-        cv = await asyncio.to_thread(storage.download_cv, user["cv_path"])
         job = (await arun(db.get_job, refnr)) or {"refnr": refnr, "title": row["title"],
                                                   "employer": row["employer"]}
         job["email"] = row["to_email"]
-        sent_to, msg_id = await asyncio.to_thread(mailer.send, user, job, row["letter"], cv,
-                                                  Path(user["cv_path"]).suffix)
+        files = await asyncio.to_thread(mailer.application_files, user, job, row["letter"])
+        sent_to, msg_id = await asyncio.to_thread(mailer.send, user, job, row["letter"], files)
         delivered = True                                     # mail is out; never retry after this point
         await arun(db.mark_sent, app_id, row["to_email"], msg_id)
         sheets.fire(uid, refnr)

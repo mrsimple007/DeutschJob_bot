@@ -15,6 +15,8 @@ from config import (MAX_SHOW, DRY_RUN, ALLOW_SHARED_SENDER, ADMIN_IDS, EMAIL_RE,
                     CANCEL_WINDOW_MIN, WORK_START, WORK_END, log, step)
 import autopilot
 import replies
+import letters
+from collections import defaultdict
 DONE_STATES = ("sent", "queued", "sending", "applied_manual")
 STATUS_ICON = {"draft": "📝", "queued": "⏳", "sending": "📤", "sent": "✅", "failed": "⚠️",
                "cancelled": "✖", "applied_manual": "✅"}
@@ -55,7 +57,7 @@ def main_menu(uid: int) -> InlineKeyboardMarkup:
         [B("🕘 History", callback_data="menu:history"), B("📝 Note", callback_data="menu:note")],
 
         [B("📬 Replies", callback_data="menu:replies"), B("⚡ Run now", callback_data="menu:run")],
-        [B("🗑 Delete my data", callback_data="menu:delete")],
+        [B("📎 Attachments", callback_data="menu:files"), B("🗑 Delete my data", callback_data="menu:delete")],
     ]
     if is_admin(uid):
         rows.append([B("👥 Clients", callback_data="adm:open"), B("📊 Sheet", callback_data="adm:sheet")])
@@ -97,6 +99,7 @@ PUBLIC_COMMANDS = [
     BotCommand("note", "Add context for your letters"),
     BotCommand("run", "Run a scan and send applications immediately"),
     BotCommand("replies", "Track employer replies in your inbox"),
+    BotCommand("files", "Certificates and references sent with applications"),
     BotCommand("delete", "Delete all your data"),
 ]
 ADMIN_COMMANDS = PUBLIC_COMMANDS + [
@@ -247,7 +250,7 @@ async def on_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     actions = {"search": search_cmd, "profile": profile_cmd, "sender": sender_cmd, "auto": auto_cmd,
                "location": location_cmd, "stats": stats_cmd, "history": history_cmd,
-               "note": note_cmd, "delete": delete_cmd, "run": run_cmd, "replies": replies_cmd}
+               "note": note_cmd, "delete": delete_cmd, "run": run_cmd, "replies": replies_cmd, "files": files_cmd}
     fn = actions.get(q.data.split(":", 1)[1])
     if fn:
         ctx.args = []
@@ -491,6 +494,119 @@ async def on_replies(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await replies_cmd(update, ctx)
 
 
+# ------------------------------------------------------------------ attachments (/files)
+_att_locks = defaultdict(asyncio.Lock)     # several files sent at once must not overwrite each other
+
+
+def _kb_size(n) -> str:
+    return f"{(n or 0) / 1048576:.1f} MB" if (n or 0) >= 1048576 else f"{(n or 0) // 1024} KB"
+
+
+async def files_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE, note: str = ""):
+    uid = update.effective_user.id
+    user = await arun(db.get_user, uid) or {}
+    atts = user.get("attachments") or []
+    text = ((note + "\n\n" if note else "")
+            + "📎 <b>Attachments</b>, sent with every email application:\n"
+            "1. Anschreiben (PDF, made automatically)\n2. Your CV\n"
+            + ("\n".join(f"{i + 2}. {esc(a['name'])} ({_kb_size(a.get('size'))})" for i, a in enumerate(atts))
+               if atts else "<i>No extra files yet.</i>")
+            + "\n\nGerman employers usually expect certificates and references (Zeugnisse). "
+            f"Up to {storage.ATT_MAX_FILES} files, PDF, JPG or PNG, {storage.ATT_MAX_FILE // 1048576} MB each.")
+    kb = []
+    if len(atts) < storage.ATT_MAX_FILES:
+        kb.append([B("➕ Add files", callback_data="files:add")])
+    kb += [[B(f"🗑 {a['name'][:40]}", callback_data=f"files:del:{a['id']}")] for a in atts]
+    await update.effective_message.reply_text(text, parse_mode="HTML",
+                                              reply_markup=InlineKeyboardMarkup(kb) if kb else None)
+
+
+async def on_files(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    parts = q.data.split(":")
+    if parts[1] == "add":
+        await clear_kb(q)
+        ctx.user_data["att_mode"] = True
+        await q.message.reply_text(
+            "Send the files now: PDF, JPG or PNG (photos are fine too). "
+            "Press Done when you're finished. While this is open, files are NOT treated as a new CV.",
+            reply_markup=InlineKeyboardMarkup([[B("✅ Done", callback_data="files:done")]]))
+    elif parts[1] == "done":
+        await clear_kb(q)
+        ctx.user_data.pop("att_mode", None)
+        await files_cmd(update, ctx)
+    elif parts[1] == "del" and len(parts) > 2:
+        await clear_kb(q)
+        async with _att_locks[uid]:
+            user = await arun(db.get_user, uid) or {}
+            atts = user.get("attachments") or []
+            gone = [a for a in atts if a["id"] == parts[2]]
+            if gone:
+                await arun(db.update_user, uid, attachments=[a for a in atts if a["id"] != parts[2]])
+                try:
+                    await asyncio.to_thread(storage.delete_keys, [gone[0]["key"]])
+                except Exception:
+                    log.warning("[files] storage delete failed for user %s", uid, exc_info=True)
+        await files_cmd(update, ctx, note=f"🗑 Removed {esc(gone[0]['name'])}." if gone else "")
+
+
+async def add_attachment(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tg_obj, filename: str, size):
+    uid = update.effective_user.id
+    say = update.effective_message.reply_text
+    ext = Path(filename).suffix.lower()
+    if ext not in storage.ATT_MIME:
+        await say("Only PDF, JPG or PNG files can be attached.")
+        return
+    if size and size > storage.ATT_MAX_FILE:
+        await say(f"{filename} is too large (max {storage.ATT_MAX_FILE // 1048576} MB per file).")
+        return
+    async with _att_locks[uid]:
+        user = await arun(db.get_user, uid)
+        if not user:
+            await say("Send your CV first, then add attachments.")
+            ctx.user_data.pop("att_mode", None)
+            return
+        atts = user.get("attachments") or []
+        if len(atts) >= storage.ATT_MAX_FILES:
+            await say(f"You already have {storage.ATT_MAX_FILES} files. Remove one in /files first.")
+            ctx.user_data.pop("att_mode", None)
+            return
+        try:
+            tg_file = await tg_obj.get_file()
+            data = bytes(await tg_file.download_as_bytearray())
+            if sum(a.get("size") or 0 for a in atts) + len(data) > storage.ATT_MAX_TOTAL:
+                await say(f"Total attachments would exceed {storage.ATT_MAX_TOTAL // 1048576} MB. "
+                          "Remove a file or send a smaller one.")
+                return
+            meta = await asyncio.to_thread(storage.upload_attachment, uid, data, filename)
+        except Exception:
+            log.exception("[files] upload failed for user %s", uid)
+            await say(f"Could not save {filename}. Please try again.")
+            return
+        atts = atts + [meta]
+        await arun(db.update_user, uid, attachments=atts)
+    log.info("[files] user %s added attachment (%d/%d)", uid, len(atts), storage.ATT_MAX_FILES)
+    left = storage.ATT_MAX_FILES - len(atts)
+    if left <= 0:
+        ctx.user_data.pop("att_mode", None)
+        await say(f"✅ Added {filename}. That's the maximum of {storage.ATT_MAX_FILES} files.")
+        await files_cmd(update, ctx)
+    else:
+        await say(f"✅ Added {filename} ({len(atts)}/{storage.ATT_MAX_FILES}). Send more or press Done above.")
+
+
+async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.user_data.get("att_mode"):
+        await update.effective_message.reply_text(
+            "To attach a certificate, open 📎 Attachments (/files) and press Add files first.")
+        return
+    photo = update.message.photo[-1]                  # largest size
+    n = len((await arun(db.get_user, update.effective_user.id) or {}).get("attachments") or []) + 1
+    await add_attachment(update, ctx, photo, f"Dokument_{n}.jpg", photo.file_size)
+
+
 # ------------------------------------------------------------------ stats / admin
 async def stats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rows = await arun(db.client_stats, update.effective_user.id)
@@ -615,6 +731,9 @@ async def on_admin_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     doc = update.message.document
+    if ctx.user_data.get("att_mode"):                  # /files -> Add: documents are attachments, not a CV
+        await add_attachment(update, ctx, doc, doc.file_name or "file", doc.file_size)
+        return
     ext = Path(doc.file_name or "").suffix.lower()
     log.info("[tg] document from user %s: %s", uid, doc.file_name)
     if ext not in (".pdf", ".docx"):
@@ -725,7 +844,8 @@ async def auto_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                         InlineKeyboardButton("No", callback_data="autoconsent:no")]])
             await update.effective_message.reply_text(
                 "Auto mode applies to jobs for you without asking each time.\n\n"
-                "• Your CV and cover letter are emailed to employers from your email address.\n"
+                "• Your CV, cover letter (also as PDF) and /files attachments are emailed to employers "
+                "from your email address.\n"
                 "• Your CV is processed by Google's Gemini API.\n"
                 f"• You get a Telegram message with a Cancel button; mails wait at least {CANCEL_WINDOW_MIN} minutes "
                 f"and go out only Mon-Fri {WORK_START}:00-{WORK_END}:00 (Berlin).\n"
@@ -754,7 +874,8 @@ async def delete_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Yes, delete everything", callback_data="delete:yes"),
                                 InlineKeyboardButton("Cancel", callback_data="delete:no")]])
     await update.effective_message.reply_text(
-        "This permanently deletes your CV, profile, email connection, settings, drafts and application history. "
+        "This permanently deletes your CV, attachments, profile, email connection, settings, drafts and "
+        "application history. "
         "Emails already sent to employers cannot be recalled.", reply_markup=kb)
 
 
@@ -799,12 +920,18 @@ async def make_draft(q, job: dict):
               [InlineKeyboardButton("🔄 Rewrite", callback_data=f"regen:{ref}"),
                InlineKeyboardButton("✅ Mark as applied", callback_data=f"done:{ref}")]]
         await note.edit_text(preview + "\n\n<i>This job uses a website form. Copy the letter, "
-                             "or use the DOCX below, and apply on the page.</i>",
+                             "or upload the PDF / DOCX below, and apply on the page.</i>",
                              parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+        name = letters.safe_name(user["profile"].get("full_name") or "")
+        try:
+            pdf = await asyncio.to_thread(letters.letter_pdf, user["profile"], job, letter)
+            await q.message.reply_document(pdf, filename=f"Anschreiben_{name}.pdf")
+        except Exception:
+            log.exception("[letters] PDF failed for %s", ref)
         path = await asyncio.to_thread(letter_docx, uid, job, letter)
         try:
             with open(path, "rb") as fh:
-                await q.message.reply_document(fh, filename=f"Anschreiben_{ref}.docx")
+                await q.message.reply_document(fh, filename=f"Anschreiben_{name}.docx")
         finally:
             path.unlink(missing_ok=True)
 
@@ -897,9 +1024,8 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         try:
             with step(f"send application {refnr}"):
-                cv = await asyncio.to_thread(storage.download_cv, user["cv_path"])
-                sent_to, msg_id = await asyncio.to_thread(mailer.send, user, job, app["letter"], cv,
-                                                          Path(user["cv_path"]).suffix)
+                files = await asyncio.to_thread(mailer.application_files, user, job, app["letter"])
+                sent_to, msg_id = await asyncio.to_thread(mailer.send, user, job, app["letter"], files)
         except Exception as e:
             log.exception("send failed")
             await arun(db.set_status, uid, refnr, "draft", ["sending"], error=str(e)[:500])

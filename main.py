@@ -32,6 +32,8 @@ def main():
     app.add_handler(CommandHandler("sheet", h.sheet_cmd))# main.py
     app.add_handler(CommandHandler("run", h.run_cmd))
     app.add_handler(CommandHandler("replies", h.replies_cmd))
+    app.add_handler(CommandHandler("files", h.files_cmd))
+    app.add_handler(CallbackQueryHandler(h.on_files, pattern=r"^files:"))
     app.add_handler(CallbackQueryHandler(h.on_replies, pattern=r"^replies:"))
     app.add_handler(CallbackQueryHandler(h.on_run, pattern=r"^run:"))
 
@@ -45,6 +47,7 @@ def main():
 
     # ---- CV upload
     app.add_handler(MessageHandler(filters.Document.ALL, h.on_document))
+    app.add_handler(MessageHandler(filters.PHOTO, h.on_photo))
     app.add_error_handler(h.on_error)
 
     # ---- scheduled jobs
