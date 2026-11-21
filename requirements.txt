@@ -1,5 +1,5 @@
 python-telegram-bot[job-queue]>=20.0
-google-generativeai
+google-genai>=1.0
 python-docx
 httpx
 python-dotenv

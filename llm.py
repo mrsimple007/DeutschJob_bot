@@ -3,11 +3,13 @@ import json, re, tempfile, threading, time
 from pathlib import Path
 from typing import Optional
 
-import docx
-import google.generativeai as genai
-from google.api_core import exceptions as gexc
-
 import os
+
+import docx
+import httpx
+from google import genai
+from google.genai import errors as gerr, types as gtypes
+
 from config import MODEL, DRY_RUN, log
 
 
@@ -63,7 +65,9 @@ class KeyPool:
 
 
 POOL = KeyPool(load_keys())
-_genai_lock = threading.Lock()  # genai.configure() is global, so serialize calls
+# One client per key: no global configure(), so calls from different threads run in parallel.
+CLIENTS = [genai.Client(api_key=k, http_options=gtypes.HttpOptions(timeout=120_000)) for k in POOL.keys]
+GEN_CONFIG = gtypes.GenerateContentConfig(response_mime_type="application/json", temperature=0.2)
 log.info("Loaded %d Gemini API key(s), model=%s, DRY_RUN=%s", len(POOL.keys), MODEL, DRY_RUN)
 
 
@@ -76,39 +80,31 @@ def gemini_json(parts, label: str = "gemini"):
         tag = f"{label} key#{ki} attempt {attempt}/{max_attempts}"
         try:
             log.info("[gemini] %s: request", tag)
-            with _genai_lock:
-                genai.configure(api_key=POOL.keys[ki])
-                model = genai.GenerativeModel(
-                    MODEL,
-                    generation_config={"response_mime_type": "application/json", "temperature": 0.2},
-                )
-                resp = model.generate_content(parts, request_options={"timeout": 120})
-                text = resp.text
-            data = json.loads(text)
+            resp = CLIENTS[ki].models.generate_content(model=MODEL, contents=parts, config=GEN_CONFIG)
+            data = json.loads(resp.text or "")
             log.info("[gemini] %s: OK", tag)
             return data
 
-        except gexc.ResourceExhausted as e:
+        except gerr.APIError as e:
             last_err = e
-            log.warning("[gemini] %s: quota/rate limit -> switching key (cooldown 60s)", tag)
-            POOL.cool(ki, 60)
-        except (gexc.PermissionDenied, gexc.Unauthenticated) as e:
-            last_err = e
-            log.error("[gemini] %s: key rejected (%s) -> disabling this key", tag, type(e).__name__)
-            POOL.kill(ki)
-        except gexc.InvalidArgument as e:
-            last_err = e
-            if "api key" in str(e).lower():
-                log.error("[gemini] %s: invalid API key -> disabling it", tag)
+            code, msg = e.code, str(e).lower()
+            if code == 429:
+                log.warning("[gemini] %s: quota/rate limit -> switching key (cooldown 60s)", tag)
+                POOL.cool(ki, 60)
+            elif code in (401, 403) or (code == 400 and "api key" in msg):
+                log.error("[gemini] %s: key rejected (HTTP %s) -> disabling this key", tag, code)
                 POOL.kill(ki)
+            elif code == 408 or code >= 500:
+                delay = min(2 ** attempt, 20)
+                log.warning("[gemini] %s: transient HTTP %s -> retry in %ds", tag, code, delay)
+                time.sleep(delay)
             else:
-                log.error("[gemini] %s: bad request: %s", tag, e)
+                log.error("[gemini] %s: bad request (HTTP %s): %s", tag, code, e)
                 raise
-        except (gexc.ServiceUnavailable, gexc.InternalServerError, gexc.DeadlineExceeded,
-                gexc.TooManyRequests) as e:
+        except (httpx.TimeoutException, httpx.TransportError) as e:
             last_err = e
             delay = min(2 ** attempt, 20)
-            log.warning("[gemini] %s: transient %s -> retry in %ds", tag, type(e).__name__, delay)
+            log.warning("[gemini] %s: network %s -> retry in %ds", tag, type(e).__name__, delay)
             time.sleep(delay)
         except (json.JSONDecodeError, ValueError) as e:
             last_err = e
@@ -131,7 +127,7 @@ Use null if something is not in the CV. Do not invent information."""
 
 def parse_cv_sync(path: Path) -> dict:
     if path.suffix.lower() == ".pdf":
-        part = {"mime_type": "application/pdf", "data": path.read_bytes()}
+        part = gtypes.Part.from_bytes(data=path.read_bytes(), mime_type="application/pdf")
         data = gemini_json([PROFILE_PROMPT, part], label="parse-cv")
     else:
         d = docx.Document(str(path))
