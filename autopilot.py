@@ -43,8 +43,8 @@ async def scan_all(ctx: ContextTypes.DEFAULT_TYPE):
 
 async def scan_user(ctx: ContextTypes.DEFAULT_TYPE, u: dict, immediate: bool = False) -> dict:
     uid, profile = u["tg_id"], u["profile"]
-    st = dict(total=0, known=0, no_email=0, german=0, low_score=0,
-              cooldown=0, letter_failed=0, queued=0, note="")
+    st = dict(total=0, known=0, no_email=0, cooldown=0, letter_failed=0, queued=0, note="")
+    queued_refs = []
     if not (db.has_sender(u) or DRY_RUN or ALLOW_SHARED_SENDER):
         st["note"] = "no sender connected"
         return st
@@ -68,7 +68,7 @@ async def scan_user(ctx: ContextTypes.DEFAULT_TYPE, u: dict, immediate: bool = F
         cands.append(j)
     cands.sort(key=lambda j: j["score"], reverse=True)
 
-    log.info("[auto] user %s funnel: %s (min_score=%s)", uid, st, u["min_score"])
+    log.info("[auto] user %s funnel: %s", uid, st)
 
     for job in cands:
         if remaining <= 0:
@@ -90,8 +90,10 @@ async def scan_user(ctx: ContextTypes.DEFAULT_TYPE, u: dict, immediate: bool = F
             continue
         remaining -= 1
         st["queued"] += 1
+        queued_refs.append(job["refnr"])
         sheets.fire(uid, job["refnr"])
         await notify_queued(ctx, uid, job, letter, send_after)
+    st["refnrs"] = queued_refs
     return st
 
 async def notify_queued(ctx, uid, job, letter, send_after):
@@ -126,8 +128,25 @@ async def requeue(row: dict, err) -> bool:
                       error=str(err)[:500], send_after=when.isoformat())
 
 
-async def send_due(ctx: ContextTypes.DEFAULT_TYPE, force: bool = False):
-    if not force and not in_work_window():
+async def send_now(ctx: ContextTypes.DEFAULT_TYPE, uid: int, refnrs: list) -> int:
+    """Run now: send ONLY this user's just-queued applications, immediately, at any hour.
+    Each row is claimed queued -> sending first, so a cancel or the regular worker can't double-send."""
+    sent = 0
+    for refnr in refnrs:
+        rows = await arun(db.set_status, uid, refnr, "sending", ["queued"])
+        if not rows:
+            continue                     # cancelled, or already picked up by send_due
+        if sent:
+            await asyncio.sleep(random.uniform(*SEND_GAP))
+        result = await send_one(ctx, rows[0])
+        if result == "transient":
+            break                        # network down: the rest stay queued for the regular worker
+        sent += result == "ok"
+    return sent
+
+
+async def send_due(ctx: ContextTypes.DEFAULT_TYPE):
+    if not in_work_window():
         return
     rows = await arun(db.claim_due, SEND_BATCH)
     for i, row in enumerate(rows):

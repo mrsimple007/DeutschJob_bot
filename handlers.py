@@ -120,7 +120,7 @@ async def run_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                 B("Cancel", callback_data="run:no")]])
     await update.effective_message.reply_text(
         f"This scans now and sends up to {user['daily_limit']} real applications within a minute or two, "
-        "ignoring the cancel window and work hours. Your daily limit and min score still apply.",
+        "ignoring the cancel window and work hours. Your daily limit still applies.",
         reply_markup=kb)
 
 
@@ -143,15 +143,14 @@ async def on_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     await msg.edit_text(
         f"Jobs found: {st['total']}\n"
-        f"Already seen: {st['known']} · no email: {st['no_email']} · German required: {st['german']}\n"
-        f"Score below {user['min_score']}: {st['low_score']} · employer cooldown: {st['cooldown']}\n"
-        f"✅ Queued: {st['queued']}" + (f"\nℹ️ {st['note']}" if st["note"] else ""))
-    if st["queued"]:
-        from config import SEND_BATCH
-        for _ in range(-(-st["queued"] // SEND_BATCH)):    # ceil
-            await autopilot.send_due(ctx, force=True)
+        f"Already seen: {st['known']} · no email: {st['no_email']} · employer cooldown: {st['cooldown']}"
+        + (f" · letter failed: {st['letter_failed']}" if st["letter_failed"] else "")
+        + f"\n✅ Queued: {st['queued']}" + (f" — sending now..." if st["queued"] else "")
+        + (f"\nℹ️ {st['note']}" if st["note"] else ""))
+    if st.get("refnrs"):
+        await autopilot.send_now(ctx, uid, st["refnrs"])
 
-            
+
 async def setup_bot(app):
     """Run once at startup (post_init): sets the command list, description and about text."""
     bot = app.bot
@@ -441,7 +440,7 @@ async def _client_card(tg_id: int):
     r = rows[0]
     u = await arun(db.get_user, tg_id) or {}
     text = (fmt_stats_line(r) +
-            f"\n   limit {u.get('daily_limit')}/day · min score {u.get('min_score')} · "
+            f"\n   limit {u.get('daily_limit')}/day · "
             f"📍 {esc(u.get('location') or 'all of Germany')}")
     kb = [[B("📄 Latest applications", callback_data=f"adm:a:{tg_id}")]]
     if r["auto_on"]:
@@ -610,9 +609,8 @@ async def auto_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"Auto mode: {'ON' if user['auto_on'] else 'OFF'}\n"
             f"Sender: {user.get('smtp_user') or 'not connected (/sender)'}\n"
             f"Daily limit: {user['daily_limit']} (used today: {today})\n"
-            f"Minimum match score: {user['min_score']}\n"
             f"Location: {user.get('location') or 'all of Germany'}\n\n"
-            "/auto on | off | limit N (1-10) | score N")
+            f"/auto on | off | limit N (1-{MAX_DAILY})")
         return
 
     if sub == "on":
@@ -640,21 +638,15 @@ async def auto_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif sub == "off":
         await arun(db.update_user, uid, auto_on=False)
         await update.effective_message.reply_text("Auto mode OFF. Already queued letters can still be cancelled with their button.")
-    elif sub in ("limit", "score") and len(ctx.args) > 1 and ctx.args[1].isdigit():
+    elif sub == "limit" and len(ctx.args) > 1 and ctx.args[1].isdigit():
         n = int(ctx.args[1])
-        if sub == "limit":
-            if not 1 <= n <= MAX_DAILY:
-                await update.effective_message.reply_text(f"Limit must be between 1 and {MAX_DAILY}.")
-                return
-            await arun(db.update_user, uid, daily_limit=n)
-        else:
-            if not 0 <= n <= 30:
-                await update.effective_message.reply_text(f"Score must be between 0 and 30.")
-                return
-            await arun(db.update_user, uid, min_score=n)
-        await update.effective_message.reply_text(f"Saved: {sub} = {n}")
+        if not 1 <= n <= MAX_DAILY:
+            await update.effective_message.reply_text(f"Limit must be between 1 and {MAX_DAILY}.")
+            return
+        await arun(db.update_user, uid, daily_limit=n)
+        await update.effective_message.reply_text(f"Saved: limit = {n}/day")
     else:
-        await update.effective_message.reply_text("Usage: /auto on | off | limit N | score N | status")
+        await update.effective_message.reply_text("Usage: /auto on | off | limit N | status")
 
 
 # ------------------------------------------------------------------ delete
@@ -818,7 +810,3 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await clear_kb(q)
         note = " (DRY RUN: sent to yourself)" if DRY_RUN else ""
         await q.message.reply_text(f"✅ Application sent to {sent_to}{note}")
-
-
-async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
-    log.error("Unhandled error", exc_info=ctx.error)

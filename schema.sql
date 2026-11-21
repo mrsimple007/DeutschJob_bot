@@ -8,7 +8,7 @@ create table if not exists deutschjob_users (
   location      text,                        -- search city, null = all of Germany
   note          text,                        -- /note: extra context for letters
   auto_on       boolean not null default false,
-  daily_limit   int not null default 5 check (daily_limit between 1 and 10),
+  daily_limit   int not null default 5 check (daily_limit between 1 and 30),
   min_score     int not null default 4,
   consent_at    timestamptz,                 -- GDPR consent for auto mode
   created_at    timestamptz not null default now(),
@@ -131,3 +131,8 @@ notify pgrst, 'reload schema';
 
 alter table deutschjob_applications add column if not exists sender_email text;
 notify pgrst, 'reload schema';
+
+-- 4. Daily limit up to 30 (matches MAX_DAILY in handlers.py)
+alter table deutschjob_users drop constraint if exists deutschjob_users_daily_limit_check;
+alter table deutschjob_users add constraint deutschjob_users_daily_limit_check
+  check (daily_limit between 1 and 30);
