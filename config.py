@@ -18,7 +18,7 @@ logging.basicConfig(
 )
 # httpx logs full URLs at INFO, which includes the Telegram bot token. Silence it.
 for noisy in ("httpx", "httpcore", "telegram", "hpack", "postgrest", "supabase", "apscheduler",
-              "google_genai"):
+              "google_genai", "fontTools"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 log = logging.getLogger("jobbot")
 
@@ -46,10 +46,14 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]   # service_role key, server-side only
 
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-# used when MODEL is overloaded (503/504). Empty = no fallback. A wrong name is detected (404) and ignored.
-FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-flash-lite-latest").strip()
-if FALLBACK_MODEL == MODEL:
-    FALLBACK_MODEL = ""
+# Free models tried in this order when the current one is overloaded (503/504) or rate-limited (429).
+# Comma-separated; a name the API doesn't know (404) is skipped for the rest of the run.
+FALLBACK_MODELS = [m for m in dict.fromkeys(
+    x.strip() for x in os.getenv(
+        "GEMINI_FALLBACK_MODELS",
+        os.getenv("GEMINI_FALLBACK_MODEL", "") or
+        "gemini-3.8-flash,gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-2.5-flash-lite").split(","))
+    if m and m != MODEL]
 USER_WAIT_S = 90                      # max seconds a user waits for Gemini (CV parsing, manual letters)
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))

@@ -10,7 +10,7 @@ import httpx
 from google import genai
 from google.genai import errors as gerr, types as gtypes
 
-from config import MODEL, FALLBACK_MODEL, DRY_RUN, log
+from config import MODEL, FALLBACK_MODELS, DRY_RUN, log
 
 
 # ------------------------------------------------------------------ key pool
@@ -67,17 +67,18 @@ class KeyPool:
 POOL = KeyPool(load_keys())
 # One client per key: no global configure(), so calls from different threads run in parallel.
 CLIENTS = [genai.Client(api_key=k, http_options=gtypes.HttpOptions(timeout=120_000)) for k in POOL.keys]
-log.info("Loaded %d Gemini API key(s), model=%s, fallback=%s, DRY_RUN=%s",
-         len(POOL.keys), MODEL, FALLBACK_MODEL or "-", DRY_RUN)
+MODELS = [MODEL] + FALLBACK_MODELS          # preference order
+log.info("Loaded %d Gemini API key(s), models=%s, DRY_RUN=%s", len(POOL.keys), " > ".join(MODELS), DRY_RUN)
 
-OVERLOAD_SWITCH = 2          # consecutive 503/504/timeouts on one model before trying the other one
-PRIMARY_REST_S = 300         # after an overload switch, new calls start on the fallback for 5 minutes
-_state = {"primary_busy_until": 0.0, "fallback_broken": False}
+BUSY_S = 120                 # an overloaded model is skipped for 2 minutes
+RATE_S = 60                  # a rate-limited model is skipped for 1 minute
+_busy_until = {}             # model -> unix time until it is skipped
+_broken = set()              # models the API doesn't know (404)
 _state_lock = threading.Lock()
 
 
 class GeminiBusy(RuntimeError):
-    """Gemini stayed overloaded until the caller's deadline. Safe to show to the user."""
+    """All models stayed overloaded until the caller's deadline. Safe to show to the user."""
 
 
 def _config(timeout_s: float) -> gtypes.GenerateContentConfig:
@@ -91,46 +92,48 @@ def _err_text(e: gerr.APIError) -> str:
     return f"{e.code} {getattr(e, 'status', '') or ''}: {(getattr(e, 'message', '') or str(e))[:200]}".strip()
 
 
-def _start_model() -> str:
+def _mark(model: str, seconds: float) -> None:
     with _state_lock:
-        use_fb = (FALLBACK_MODEL and not _state["fallback_broken"]
-                  and time.time() < _state["primary_busy_until"])
-    return FALLBACK_MODEL if use_fb else MODEL
+        _busy_until[model] = time.time() + seconds
+
+
+def _pick(tried: set) -> tuple:
+    """(model, wait_s): first usable model in preference order that this call hasn't just failed on.
+    If every model is resting, the one that frees up first, with how long to wait for it."""
+    with _state_lock:
+        usable = [m for m in MODELS if m not in _broken]
+        if not usable:
+            raise RuntimeError("No usable Gemini model (all returned 404). Check GEMINI_MODEL.")
+        now = time.time()
+        for m in usable:
+            if m not in tried and _busy_until.get(m, 0) <= now:
+                return m, 0.0
+        m = min(usable, key=lambda x: _busy_until.get(x, 0))
+        return m, max(0.0, _busy_until.get(m, 0) - now)
 
 
 def gemini_json(parts, label: str = "gemini", deadline_s: Optional[float] = None):
-    """Call Gemini expecting JSON. Rotates keys on quota/auth errors, backs off on transient ones,
-    switches to GEMINI_FALLBACK_MODEL when the model is overloaded (503/504).
+    """Call Gemini expecting JSON. On overload (503/504/timeout) or rate limit (429) the next free model
+    in MODELS is tried right away; only when all of them are busy does it wait. Bad keys are disabled.
     deadline_s: give up with GeminiBusy after this many seconds (for calls a user is waiting on)."""
-    max_attempts = max(8, len(POOL.keys) * 3)
+    max_attempts = max(10, len(MODELS) * 3, len(POOL.keys) * 3)
     t0 = time.time()
-    model = _start_model()
-    overloads = 0                                   # consecutive overloads on `model`
+    tried = set()                                   # models that failed in this call since the last wait
     last_err = None
 
     def remaining() -> float:
         return float("inf") if deadline_s is None else deadline_s - (time.time() - t0)
 
-    def backoff(attempt: int, why: str):
-        nonlocal model, overloads
-        overloads += 1
-        if overloads >= OVERLOAD_SWITCH and FALLBACK_MODEL and not _state["fallback_broken"]:
-            if model == MODEL:
-                with _state_lock:
-                    _state["primary_busy_until"] = time.time() + PRIMARY_REST_S
-            model = FALLBACK_MODEL if model == MODEL else MODEL
-            overloads = 0
-            log.warning("[gemini] %s: %s -> switching to model %s", label, why, model)
-            if model == FALLBACK_MODEL:
-                return                              # first hop: try the fallback right away
-            # both models overloaded: wait before going back to the primary
-        delay = min(2 ** attempt, 20)
-        if delay >= remaining():
-            raise GeminiBusy(f"Gemini is overloaded right now ({why}). Please try again in a few minutes.")
-        log.warning("[gemini] %s: %s -> retry in %ds", label, why, delay)
-        time.sleep(delay)
-
     for attempt in range(1, max_attempts + 1):
+        model, wait = _pick(tried)
+        if wait > 0:                                # every model is resting: wait for the first one
+            wait = min(max(wait, 2 ** min(attempt, 4)), 30)
+            if wait >= remaining() - 5:
+                raise GeminiBusy(f"All Gemini models are busy right now ({last_err}). "
+                                 "Please try again in a few minutes.")
+            log.warning("[gemini] %s: all models busy -> waiting %ds", label, wait)
+            time.sleep(wait)
+            tried.clear()
         if remaining() <= 5:
             raise GeminiBusy(f"Gemini did not answer in time ({last_err}). Please try again in a few minutes.")
         ki = POOL.acquire()
@@ -146,26 +149,30 @@ def gemini_json(parts, label: str = "gemini", deadline_s: Optional[float] = None
         except gerr.APIError as e:
             last_err = e
             code, msg = e.code, str(e).lower()
-            if code == 429:
-                log.warning("[gemini] %s: quota/rate limit (%s) -> switching key (cooldown 60s)", tag, _err_text(e))
-                POOL.cool(ki, 60)
+            if code == 429:                         # free quota is per project AND model: next model helps
+                log.warning("[gemini] %s: rate limit (%s) -> next model", tag, _err_text(e))
+                _mark(model, RATE_S)
+                tried.add(model)
+                POOL.idx = (ki + 1) % len(POOL.keys)
             elif code in (401, 403) or (code == 400 and "api key" in msg):
                 log.error("[gemini] %s: key rejected (%s) -> disabling this key", tag, _err_text(e))
                 POOL.kill(ki)
-            elif code == 404 and model == FALLBACK_MODEL:
-                log.error("[gemini] fallback model %s not found (%s) -> fallback disabled",
-                          FALLBACK_MODEL, _err_text(e))
+            elif code == 404:
+                log.error("[gemini] %s: model not found (%s) -> skipping it", tag, _err_text(e))
                 with _state_lock:
-                    _state["fallback_broken"] = True
-                model, overloads = MODEL, 0
+                    _broken.add(model)
             elif code == 408 or code >= 500:
-                backoff(attempt, f"overloaded {_err_text(e)}" if code in (503, 504) else _err_text(e))
+                log.warning("[gemini] %s: overloaded (%s) -> next model", tag, _err_text(e))
+                _mark(model, BUSY_S)
+                tried.add(model)
             else:
                 log.error("[gemini] %s: bad request (%s)", tag, _err_text(e))
                 raise
         except (httpx.TimeoutException, httpx.TransportError) as e:
             last_err = e
-            backoff(attempt, f"network {type(e).__name__}")
+            log.warning("[gemini] %s: network %s -> next model", tag, type(e).__name__)
+            _mark(model, BUSY_S)
+            tried.add(model)
         except (json.JSONDecodeError, ValueError) as e:
             last_err = e
             log.warning("[gemini] %s: bad/empty response (%s) -> retry", tag, e)
