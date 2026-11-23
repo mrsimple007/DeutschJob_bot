@@ -221,12 +221,13 @@ def _should_set(cur: Optional[str], new: str) -> bool:
     return new in FINAL or cur not in FINAL
 
 
-async def _notify(ctx, uid: int, app: dict, outcome: str, summary: str, frm: str):
-    text = (f"{NOTIFY[outcome]}\n{esc(app.get('title'))} · {esc(app.get('employer'))}"
+async def _notify(ctx, u: dict, app: dict, outcome: str, summary: str, frm: str):
+    uid = u["tg_id"]
+    text = (f"👤 <b>{esc(db.profile_name(u))}</b>\n{NOTIFY[outcome]}\n{esc(app.get('title'))} · {esc(app.get('employer'))}"
             + (f"\n<i>{esc(summary)}</i>" if summary and outcome != "bounced" else "")
             + (f"\nFrom: {esc(frm)}" if frm and outcome != "bounced" else f"\nTo: {esc(app.get('to_email'))}"))
     try:
-        await ctx.bot.send_message(uid, text[:4000], parse_mode="HTML",
+        await ctx.bot.send_message(db.chat_id(u), text[:4000], parse_mode="HTML",
                                    disable_notification=outcome == "acknowledged")
     except Exception:
         log.warning("[replies] could not notify user %s", uid)
@@ -252,8 +253,9 @@ async def check_user(ctx, u: dict, notify_login_error: bool = True) -> dict:
         log.warning("[replies] IMAP error for user %s: %s", uid, err)
         if notify_login_error and not u.get("imap_error"):
             try:
-                await ctx.bot.send_message(uid, "📬 Reply tracking could not log in to your mailbox "
-                                                f"({imap_host_for(u)}). Check /replies.")
+                await ctx.bot.send_message(db.chat_id(u), f"👤 {db.profile_name(u)}\n"
+                                           "📬 Reply tracking could not log in to the mailbox "
+                                           f"({imap_host_for(u)}). Check /replies.")
             except Exception:
                 pass
         await arun(db.update_user, uid, imap_error=err)
@@ -289,7 +291,7 @@ async def check_user(ctx, u: dict, notify_login_error: bool = True) -> dict:
         st["new"] += 1
         st[outcome] += 1
         log.info("[replies] user %s app %s -> %s", uid, app["id"], outcome)
-        await _notify(ctx, uid, app, outcome, summary, it["from"])
+        await _notify(ctx, u, app, outcome, summary, it["from"])
 
     await arun(db.update_user, uid, imap_checked_at=now_iso(), imap_error=None)
     return st

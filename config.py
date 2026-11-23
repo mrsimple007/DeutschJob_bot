@@ -17,7 +17,8 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 # httpx logs full URLs at INFO, which includes the Telegram bot token. Silence it.
-for noisy in ("httpx", "httpcore", "telegram", "hpack", "postgrest", "supabase", "apscheduler"):
+for noisy in ("httpx", "httpcore", "telegram", "hpack", "postgrest", "supabase", "apscheduler",
+              "google_genai"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 log = logging.getLogger("jobbot")
 
@@ -45,6 +46,11 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_KEY"]   # service_role key, server-side only
 
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+# used when MODEL is overloaded (503/504). Empty = no fallback. A wrong name is detected (404) and ignored.
+FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-flash-lite-latest").strip()
+if FALLBACK_MODEL == MODEL:
+    FALLBACK_MODEL = ""
+USER_WAIT_S = 90                      # max seconds a user waits for Gemini (CV parsing, manual letters)
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 SMTP_USER = os.getenv("SMTP_USER", "")
@@ -85,3 +91,6 @@ DIGEST_HOUR = 18   # daily admin summary, Berlin time
 REPLY_CHECK_INTERVAL_S = 30 * 60      # check opted-in inboxes every 30 minutes
 REPLY_LOOKBACK_DAYS = 60              # only match replies to applications sent in this window
 REPLY_MAX_SCAN = 300                  # newest inbox messages scanned (headers only) per check
+
+# ------------------------------------------------------------------ profiles
+MAX_PROFILES = 10                     # candidate profiles one Telegram account can manage

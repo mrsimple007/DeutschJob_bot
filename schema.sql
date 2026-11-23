@@ -202,3 +202,11 @@ notify pgrst, 'reload schema';
 alter table deutschjob_users
   add column if not exists attachments jsonb not null default '[]'::jsonb;
 notify pgrst, 'reload schema';
+
+-- 7. Several candidate profiles per Telegram account
+--    extra profiles: tg_id < 0, owner_id = Telegram id of the manager; active_profile lives on the owner's row
+alter table deutschjob_users
+  add column if not exists owner_id       bigint,
+  add column if not exists active_profile bigint;
+create index if not exists deutschjob_users_owner_idx on deutschjob_users (owner_id);
+notify pgrst, 'reload schema';

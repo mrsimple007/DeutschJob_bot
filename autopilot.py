@@ -16,6 +16,17 @@ from config import (TZ, WORK_START, WORK_END, CANCEL_WINDOW_MIN, JITTER_MAX_MIN,
 esc = lambda x: html.escape(str(x if x is not None else ""))
 
 
+def who_tag(u) -> str:
+    """'👤 Name' line so the owner of several profiles knows which candidate a message is about."""
+    return f"👤 <b>{esc(db.profile_name(u))}</b>\n"
+
+
+def cb(action: str, refnr: str, pid: int) -> str:
+    """Callback data carrying the profile id (Telegram limit 64 bytes; old format as fallback)."""
+    s = f"{action}:{refnr}@{pid}"
+    return s if len(s.encode()) <= 64 else f"{action}:{refnr}"
+
+
 def in_work_window() -> bool:
     now = datetime.now(TZ)
     return now.weekday() < 5 and WORK_START <= now.hour < WORK_END
@@ -92,18 +103,19 @@ async def scan_user(ctx: ContextTypes.DEFAULT_TYPE, u: dict, immediate: bool = F
         st["queued"] += 1
         queued_refs.append(job["refnr"])
         sheets.fire(uid, job["refnr"])
-        await notify_queued(ctx, uid, job, letter, send_after)
+        await notify_queued(ctx, u, job, letter, send_after)
     st["refnrs"] = queued_refs
     return st
 
-async def notify_queued(ctx, uid, job, letter, send_after):
+async def notify_queued(ctx, u, job, letter, send_after):
+    uid = u["tg_id"]
     when = send_after.astimezone(TZ).strftime("%H:%M")
-    text = (f"🤖 <b>Auto-apply queued</b>\n{esc(job['title'])} · {esc(job['employer'])}\n"
+    text = (f"{who_tag(u)}🤖 <b>Auto-apply queued</b>\n{esc(job['title'])} · {esc(job['employer'])}\n"
             f"Not before {when} (Berlin). Sends only Mon-Fri {WORK_START}:00-{WORK_END}:00.\n\n"
             f"<b>{esc(letter['subject'])}</b>\n\n{esc(letter['body'])}")
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✖ Cancel", callback_data=f"cancel:{job['refnr']}")]])
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("✖ Cancel", callback_data=cb("cancel", job["refnr"], uid))]])
     try:
-        await ctx.bot.send_message(uid, text[:4000], parse_mode="HTML", reply_markup=kb,
+        await ctx.bot.send_message(db.chat_id(u), text[:4000], parse_mode="HTML", reply_markup=kb,
                                    disable_web_page_preview=True)
     except Exception:
         log.exception("[auto] could not notify user %s", uid)
@@ -164,6 +176,7 @@ async def send_one(ctx, row: dict) -> str:
     uid, refnr, app_id = row["tg_id"], row["refnr"], row["id"]
     who = "?"
     delivered = False
+    user = None
     try:
         user = await arun(db.get_user, uid)
         if not user or not user.get("profile") or not user.get("cv_path"):
@@ -201,7 +214,8 @@ async def send_one(ctx, row: dict) -> str:
                                      f"{esc(row['title'])} · {esc(row['employer'])}\n{esc(str(e)[:300])}")
             status = "failed"
     try:
-        await ctx.bot.send_message(uid, msg, parse_mode="HTML")
+        if db.chat_id(user):
+            await ctx.bot.send_message(db.chat_id(user), who_tag(user) + msg, parse_mode="HTML")
     except Exception:
         log.warning("[auto] could not notify user %s", uid)
     return status

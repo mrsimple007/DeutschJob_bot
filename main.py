@@ -33,6 +33,8 @@ def main():
     app.add_handler(CommandHandler("run", h.run_cmd))
     app.add_handler(CommandHandler("replies", h.replies_cmd))
     app.add_handler(CommandHandler("files", h.files_cmd))
+    app.add_handler(CommandHandler("profiles", h.profiles_cmd))
+    app.add_handler(CallbackQueryHandler(h.on_profiles, pattern=r"^prof:"))
     app.add_handler(CallbackQueryHandler(h.on_files, pattern=r"^files:"))
     app.add_handler(CallbackQueryHandler(h.on_replies, pattern=r"^replies:"))
     app.add_handler(CallbackQueryHandler(h.on_run, pattern=r"^run:"))

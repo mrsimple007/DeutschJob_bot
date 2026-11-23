@@ -8,12 +8,13 @@ import sheets
 import db, mailer, storage, crypto
 from db import arun, now_iso
 from jobs import find_jobs_cached
-from llm import parse_cv_sync, write_letter_sync, letter_docx
+from llm import parse_cv_sync, write_letter_sync, letter_docx, GeminiBusy
 from matching import quick_info
 from autopilot import fmt_stats_line
 from config import (MAX_SHOW, DRY_RUN, ALLOW_SHARED_SENDER, ADMIN_IDS, EMAIL_RE,
-                    CANCEL_WINDOW_MIN, WORK_START, WORK_END, log, step)
+                    CANCEL_WINDOW_MIN, WORK_START, WORK_END, MAX_PROFILES, USER_WAIT_S, log, step)
 import autopilot
+from autopilot import cb
 import replies
 import letters
 from collections import defaultdict
@@ -40,6 +41,33 @@ def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
 
 
+# ------------------------------------------------------------------ active profile
+async def owned_profile(owner: int, pid: int):
+    """The profile row if `owner` may manage it, else None."""
+    p = await arun(db.get_user, pid)
+    if p and (p["tg_id"] == owner or p.get("owner_id") == owner):
+        return p
+    return None
+
+
+async def current_pid(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    """Profile that commands act on: the owner's active profile, default their own (= Telegram id)."""
+    owner = update.effective_user.id
+    pid = ctx.user_data.get("pid")
+    if pid is None:
+        o = await arun(db.get_user, owner)
+        pid = (o or {}).get("active_profile") or owner
+    if pid != owner and not await owned_profile(owner, pid):
+        pid = owner                                   # profile was deleted
+    ctx.user_data["pid"] = pid
+    return pid
+
+
+async def set_active(owner: int, pid: int, ctx) -> None:
+    await arun(db.update_user, owner, active_profile=pid)
+    ctx.user_data["pid"] = pid
+
+
 from telegram.error import NetworkError, TimedOut
 
 async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -51,7 +79,7 @@ async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def main_menu(uid: int) -> InlineKeyboardMarkup:
     rows = [
-        [B("🔎 Search jobs", callback_data="menu:search"), B("👤 Profile", callback_data="menu:profile")],
+        [B("👥 Profiles", callback_data="prof:list"), B("🔎 Search jobs", callback_data="menu:search")],
         [B("📧 Email sender", callback_data="menu:sender"), B("🤖 Auto mode", callback_data="menu:auto")],
         [B("📍 Location", callback_data="menu:location"), B("📊 Stats", callback_data="menu:stats")],
         [B("🕘 History", callback_data="menu:history"), B("📝 Note", callback_data="menu:note")],
@@ -90,7 +118,8 @@ def auto_kb(user: dict) -> InlineKeyboardMarkup:
 PUBLIC_COMMANDS = [
     BotCommand("start", "Open the main menu"),
     BotCommand("search", "Find and rank jobs"),
-    BotCommand("profile", "Show your parsed profile"),
+    BotCommand("profiles", "All candidate profiles: switch, auto on/off, limits"),
+    BotCommand("profile", "Show the active profile"),
     BotCommand("location", "Choose a search city"),
     BotCommand("sender", "Connect your email account"),
     BotCommand("auto", "Automatic applications"),
@@ -115,7 +144,7 @@ ABOUT = "Job search in Germany: CV → matched jobs → AI cover letters → sen
 
 
 async def run_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+    uid = await current_pid(update, ctx)
     user = await arun(db.get_user, uid)
     if not user or not user.get("profile") or not user.get("cv_path"):
         await update.effective_message.reply_text("Send your CV first.")
@@ -137,7 +166,7 @@ async def on_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await clear_kb(q)
     if q.data != "run:yes":
         return
-    uid = q.from_user.id
+    uid = await current_pid(update, ctx)
     user = await arun(db.get_user, uid)
     if not user or not user.get("profile"):
         return
@@ -195,22 +224,25 @@ def sender_ok(user) -> bool:
 
 # ------------------------------------------------------------------ simple commands
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    log.info("[tg] /start from user %s", uid)
+    owner = update.effective_user.id
+    pid = await current_pid(update, ctx)
+    log.info("[tg] /start from user %s (profile %s)", owner, pid)
+    active = await arun(db.get_user, pid)
     await update.effective_message.reply_text(
-        "Hi! Send me your CV (PDF or DOCX) to begin, then use the buttons below.\n\n"
+        "Hi! Send me your CV (PDF or DOCX) to begin, then use the buttons below.\n"
+        f"⭐ Active profile: {db.profile_name(active)} (switch in 👥 Profiles)\n\n"
         "Privacy: your CV is sent to employers by email and processed by Google's Gemini API.",
-        reply_markup=main_menu(uid))
+        reply_markup=main_menu(owner))
 
 
 async def profile_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    u = await arun(db.get_user, update.effective_user.id)
+    u = await arun(db.get_user, await current_pid(update, ctx))
     p = u and u.get("profile")
     await update.effective_message.reply_text(format_profile(p) if p else "Send your CV first.")
 
 
 async def location_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+    uid = await current_pid(update, ctx)
     if not ctx.args:
         u = await arun(db.get_user, uid)
         cur = (u or {}).get("location")
@@ -236,8 +268,9 @@ async def on_location_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if val != "clear" and val not in CITIES:
         return
     loc = None if val == "clear" else val
-    await arun(db.update_user, q.from_user.id, location=loc)
-    log.info("[tg] user %s location -> %s", q.from_user.id, loc)
+    pid = await current_pid(update, ctx)
+    await arun(db.update_user, pid, location=loc)
+    log.info("[tg] user %s location -> %s", pid, loc)
     try:
         await q.edit_message_text(f"📍 Search location: {loc or 'all of Germany'}\n\nRun /search to use it.",
                                   reply_markup=city_kb(loc))
@@ -268,7 +301,7 @@ async def on_auto_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await auto_cmd(update, ctx)
 
 async def note_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+    uid = await current_pid(update, ctx)
     if not ctx.args:
         u = await arun(db.get_user, uid)
         cur = (u or {}).get("note")
@@ -289,7 +322,7 @@ async def note_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def history_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    rows = await arun(db.history, update.effective_user.id)
+    rows = await arun(db.history, await current_pid(update, ctx))
     if not rows:
         await update.effective_message.reply_text("No applications yet.")
         return
@@ -302,7 +335,7 @@ async def history_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ------------------------------------------------------------------ sender (own mailbox)
 async def sender_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+    uid = await current_pid(update, ctx)
     chat = update.effective_chat.id
     args = ctx.args or []
     secret = bool(args) and args[0].lower() not in ("test", "clear")
@@ -376,8 +409,7 @@ async def sender_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
               "Try /sender test to receive a test mail.")
 
 async def sheet_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if uid not in ADMIN_IDS:
+    if update.effective_user.id not in ADMIN_IDS:
         await update.effective_message.reply_text("Not allowed.")
         return
     if not sheets.enabled():
@@ -385,7 +417,7 @@ async def sheet_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     args = ctx.args or []
     if args and args[0].lower() == "sync":
-        n = await asyncio.to_thread(sheets.sync_user, uid)
+        n = await asyncio.to_thread(sheets.sync_user, await current_pid(update, ctx))
         await update.effective_message.reply_text(f"Synced {n} application(s).")
         return
     if args and EMAIL_RE.fullmatch(args[0].strip().lower()):
@@ -418,7 +450,7 @@ def _replies_summary(st: dict) -> str:
 
 
 async def replies_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+    uid = await current_pid(update, ctx)
     say = update.effective_message.reply_text
     user = await arun(db.get_user, uid)
     args = ctx.args or []
@@ -503,7 +535,7 @@ def _kb_size(n) -> str:
 
 
 async def files_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE, note: str = ""):
-    uid = update.effective_user.id
+    uid = await current_pid(update, ctx)
     user = await arun(db.get_user, uid) or {}
     atts = user.get("attachments") or []
     text = ((note + "\n\n" if note else "")
@@ -524,7 +556,7 @@ async def files_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE, note: str = 
 async def on_files(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    uid = q.from_user.id
+    uid = await current_pid(update, ctx)
     parts = q.data.split(":")
     if parts[1] == "add":
         await clear_kb(q)
@@ -553,7 +585,7 @@ async def on_files(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def add_attachment(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tg_obj, filename: str, size):
-    uid = update.effective_user.id
+    uid = await current_pid(update, ctx)
     say = update.effective_message.reply_text
     ext = Path(filename).suffix.lower()
     if ext not in storage.ATT_MIME:
@@ -603,13 +635,163 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "To attach a certificate, open 📎 Attachments (/files) and press Add files first.")
         return
     photo = update.message.photo[-1]                  # largest size
-    n = len((await arun(db.get_user, update.effective_user.id) or {}).get("attachments") or []) + 1
+    n = len((await arun(db.get_user, await current_pid(update, ctx)) or {}).get("attachments") or []) + 1
     await add_attachment(update, ctx, photo, f"Dokument_{n}.jpg", photo.file_size)
+
+
+# ------------------------------------------------------------------ profiles (👥)
+def _langs(p: dict) -> str:
+    prof = p.get("profile") or {}
+    return f"🇩🇪 {prof.get('german_level') or '?'} · 🇬🇧 {prof.get('english_level') or '?'}"
+
+
+async def _profiles_view(owner: int, active: int):
+    rows = await arun(db.list_profiles, owner)
+    lines, kb = [], []
+    for p in rows:
+        pid, star = p["tg_id"], "⭐ " if p["tg_id"] == active else ""
+        today = await arun(db.count_auto_today, pid)
+        name = db.profile_name(p)
+        lines.append(
+            f"{star}<b>{esc(name)}</b> · {_langs(p)}\n"
+            f"   {'🟢 auto ON' if p.get('auto_on') else '⚪ auto off'} · {today}/{p.get('daily_limit')} today · "
+            f"📍 {esc(p.get('location') or 'all DE')}\n"
+            f"   ✉️ {esc(p.get('smtp_user') or 'no sender')} · 📬 replies {'ON' if p.get('track_replies') else 'off'}"
+            f"{'' if p.get('cv_path') else ' · ⚠️ no CV'}")
+        kb.append([B(f"{star}{'🟢' if p.get('auto_on') else '⚪'} {name[:24]} · "
+                     f"{(p.get('profile') or {}).get('german_level') or '?'} · {today}/{p.get('daily_limit')}",
+                     callback_data=f"prof:open:{pid}")])
+    if len(rows) < MAX_PROFILES:
+        kb.append([B("➕ New profile", callback_data="prof:new"), B("🔄 Refresh", callback_data="prof:list")])
+    else:
+        kb.append([B("🔄 Refresh", callback_data="prof:list")])
+    text = (f"👥 <b>Profiles</b> ({len(rows)}/{MAX_PROFILES})\n"
+            "⭐ = active: CV upload, /search, /sender, /files and /replies apply to it.\n\n"
+            + ("\n\n".join(lines) if lines else "<i>No profiles yet. Send a CV or tap ➕ New profile.</i>"))
+    return text[:4000], InlineKeyboardMarkup(kb)
+
+
+async def _profile_card(p: dict, active: int):
+    pid = p["tg_id"]
+    prof = p.get("profile") or {}
+    today = await arun(db.count_auto_today, pid)
+    on = bool(p.get("auto_on"))
+    text = (f"{'⭐ ' if pid == active else ''}<b>{esc(db.profile_name(p))}</b>"
+            f"{' (active)' if pid == active else ''}\n"
+            f"{esc(prof.get('seniority') or '?')} · {esc(prof.get('years_experience') or '?')} yrs · {_langs(p)}\n"
+            f"🔎 {esc(', '.join(prof.get('job_titles') or []) or '-')}\n"
+            f"📍 Search: {esc(p.get('location') or 'all of Germany')}\n"
+            f"📄 CV: {'yes' if p.get('cv_path') else 'missing'} · 📎 extra files: {len(p.get('attachments') or [])}\n"
+            f"✉️ Sender: {esc(p.get('smtp_user') or 'not connected')}\n"
+            f"📬 Reply tracking: {'ON' if p.get('track_replies') else 'off'}\n"
+            f"🤖 Auto: {'🟢 ON' if on else '⚪ off'} · {today}/{p.get('daily_limit')} today"
+            + (f"\n📝 {esc(p['note'][:120])}" if p.get("note") else ""))
+    kb = []
+    if pid != active:
+        kb.append([B("⭐ Make active", callback_data=f"prof:act:{pid}")])
+    kb.append([B("🔴 Auto OFF" if on else "🟢 Auto ON", callback_data=f"prof:auto:{pid}:{'off' if on else 'on'}")])
+    kb.append([B(("✅ " if p.get("daily_limit") == n else "") + f"{n}/day", callback_data=f"prof:lim:{pid}:{n}")
+               for n in (3, 5, 15, MAX_DAILY)])
+    kb.append([B("⚡ Run now", callback_data=f"prof:run:{pid}"), B("🔎 Search", callback_data=f"prof:search:{pid}")])
+    kb.append([B("📧 Sender", callback_data=f"prof:sender:{pid}"), B("📬 Replies", callback_data=f"prof:rep:{pid}"),
+               B("📎 Files", callback_data=f"prof:files:{pid}")])
+    kb.append([B("🗑 Delete profile", callback_data=f"prof:del:{pid}"), B("⬅️ All profiles", callback_data="prof:list")])
+    return text[:4000], InlineKeyboardMarkup(kb)
+
+
+async def profiles_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    owner = update.effective_user.id
+    text, kb = await _profiles_view(owner, await current_pid(update, ctx))
+    await update.effective_message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+
+
+async def on_profiles(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    owner = q.from_user.id
+    parts = q.data.split(":")
+    kind = parts[1]
+    active = await current_pid(update, ctx)
+
+    async def show(text, kb):
+        try:
+            await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+        except Exception:                             # "not modified", or the message is too old to edit
+            await q.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+
+    if kind == "list":
+        await q.answer()
+        await show(*await _profiles_view(owner, active))
+        return
+    if kind == "new":
+        if len(await arun(db.list_profiles, owner)) >= MAX_PROFILES:
+            await q.answer(f"Maximum {MAX_PROFILES} profiles.", show_alert=True)
+            return
+        await q.answer()
+        pid = await arun(db.create_profile, owner)
+        await set_active(owner, pid, ctx)
+        log.info("[profiles] user %s created profile %s", owner, pid)
+        await clear_kb(q)
+        await q.message.reply_text("✅ New profile created and set as ⭐ active.\n\n"
+                                   "1. Send this person's CV (PDF or DOCX) now.\n"
+                                   "2. Connect their mailbox with /sender.\n"
+                                   "3. Open 👥 Profiles to turn auto mode on.")
+        return
+
+    pid = int(parts[2]) if len(parts) > 2 and parts[2].lstrip("-").isdigit() else None
+    p = await owned_profile(owner, pid) if pid is not None else None
+    if not p:
+        await q.answer("Profile not found.", show_alert=True)
+        await show(*await _profiles_view(owner, active))
+        return
+
+    if kind == "open":
+        await q.answer()
+        await show(*await _profile_card(p, active))
+    elif kind == "act":
+        await set_active(owner, pid, ctx)
+        await q.answer(f"⭐ {db.profile_name(p)} is now active")
+        await show(*await _profile_card(p, pid))
+    elif kind == "auto" and parts[3] == "off":
+        await arun(db.update_user, pid, auto_on=False)
+        await q.answer("Auto mode OFF")
+        await show(*await _profile_card(await arun(db.get_user, pid), active))
+    elif kind == "lim" and parts[3].isdigit() and 1 <= int(parts[3]) <= MAX_DAILY:
+        await arun(db.update_user, pid, daily_limit=int(parts[3]))
+        await q.answer(f"Limit {parts[3]}/day")
+        await show(*await _profile_card(await arun(db.get_user, pid), active))
+    elif kind == "del":
+        await q.answer()
+        await show(f"🗑 Delete profile <b>{esc(db.profile_name(p))}</b> with its CV, attachments, sender, "
+                   "settings and application history? Emails already sent cannot be recalled.",
+                   InlineKeyboardMarkup([[B("🗑 Yes, delete", callback_data=f"prof:delyes:{pid}"),
+                                          B("Cancel", callback_data=f"prof:open:{pid}")]]))
+    elif kind == "delyes":
+        await q.answer()
+        await wipe_user(pid)
+        if pid == active:
+            await set_active(owner, owner, ctx)
+        log.info("[profiles] user %s deleted profile %s", owner, pid)
+        await show(*await _profiles_view(owner, owner if pid == active else active))
+    else:
+        # actions that reuse the normal commands: switch to this profile first, then run the command
+        actions = {"auto": (auto_cmd, ["on"]), "run": (run_cmd, []), "search": (search_cmd, []),
+                   "sender": (sender_cmd, []), "rep": (replies_cmd, []), "files": (files_cmd, [])}
+        if kind not in actions:
+            await q.answer()
+            return
+        if pid != active:
+            await set_active(owner, pid, ctx)
+            await q.answer(f"⭐ {db.profile_name(p)} is now active")
+        else:
+            await q.answer()
+        fn, args = actions[kind]
+        ctx.args = list(args)
+        await fn(update, ctx)
 
 
 # ------------------------------------------------------------------ stats / admin
 async def stats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    rows = await arun(db.client_stats, update.effective_user.id)
+    rows = await arun(db.client_stats, await current_pid(update, ctx))
     if not rows:
         await update.effective_message.reply_text("No data yet.")
         return
@@ -716,7 +898,9 @@ async def on_admin_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await arun(db.update_user, cid, auto_on=False)
         log.info("[admin] %s turned auto OFF for %s", q.from_user.id, cid)
         try:
-            await ctx.bot.send_message(cid, "⏸ An admin turned your auto mode off.")
+            cu = await arun(db.get_user, cid)
+            if db.chat_id(cu):
+                await ctx.bot.send_message(db.chat_id(cu), f"⏸ An admin turned auto mode off for {db.profile_name(cu)}.")
         except Exception:
             pass
         text, kb = await _client_card(cid)
@@ -729,7 +913,7 @@ async def on_admin_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ------------------------------------------------------------------ CV upload
 async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+    uid = await current_pid(update, ctx)
     doc = update.message.document
     if ctx.user_data.get("att_mode"):                  # /files -> Add: documents are attachments, not a CV
         await add_attachment(update, ctx, doc, doc.file_name or "file", doc.file_size)
@@ -752,9 +936,14 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             data = path.read_bytes()
             await msg.edit_text("🧠 Reading your CV with AI...")
             with step("parse CV with Gemini"):
-                profile = await asyncio.to_thread(parse_cv_sync, path)
+                profile = await asyncio.to_thread(parse_cv_sync, path, USER_WAIT_S)
         with step("upload CV to storage"):
             key = await asyncio.to_thread(storage.upload_cv, uid, data, ext)
+    except GeminiBusy:
+        log.warning("[cv] Gemini busy, user %s asked to retry", uid)
+        await msg.edit_text("⏳ Google's AI (Gemini) is overloaded right now, so I couldn't read the CV. "
+                            "Please send it again in a few minutes.")
+        return
     except Exception as e:
         log.exception("CV processing failed")
         await msg.edit_text(f"Could not process the CV: {e}")
@@ -768,7 +957,7 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ------------------------------------------------------------------ search
 async def search_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+    uid = await current_pid(update, ctx)
     user = await arun(db.get_user, uid)
     profile = user and user.get("profile")
     if not profile:
@@ -777,7 +966,8 @@ async def search_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     where = user.get("location")
     titles = profile.get("job_titles") or []
     log.info("[search] user=%s where=%s titles=%s", uid, where or "Germany", titles)
-    msg = await update.effective_message.reply_text(f"🔎 Searching jobs in {where or 'all of Germany'}...")
+    msg = await update.effective_message.reply_text(
+        f"👤 {db.profile_name(user)}\n🔎 Searching jobs in {where or 'all of Germany'}...")
     try:
         jobs = await find_jobs_cached(titles, where)
         known = set(await arun(db.known_refnrs, uid))
@@ -803,9 +993,9 @@ async def search_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if job["german_warning"]:
             lines.append("⚠️ Ad seems to require strong German (C1+)")
         lines.append("✉️ Email: " + esc(job["email"]) if job["email"] else "🔗 Application via website")
-        row = [InlineKeyboardButton("✍️ Apply", callback_data=f"apply:{job['refnr']}"),
+        row = [InlineKeyboardButton("✍️ Apply", callback_data=cb("apply", job["refnr"], uid)),
                InlineKeyboardButton("🔗 Open", url=job["url"]),
-               InlineKeyboardButton("Skip", callback_data=f"skip:{job['refnr']}")]
+               InlineKeyboardButton("Skip", callback_data=cb("skip", job["refnr"], uid))]
         await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML",
                                         reply_markup=InlineKeyboardMarkup([row]),
                                         disable_web_page_preview=True)
@@ -815,7 +1005,7 @@ async def search_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ------------------------------------------------------------------ auto command
 async def auto_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+    uid = await current_pid(update, ctx)
     user = await arun(db.get_user, uid)
     sub = (ctx.args[0].lower() if ctx.args else "status")
 
@@ -840,7 +1030,7 @@ async def auto_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.effective_message.reply_text("Connect your email first with /sender.")
             return
         if not user.get("consent_at"):
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ I agree", callback_data="autoconsent:yes"),
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ I agree", callback_data=cb("autoconsent", "yes", uid)),
                                         InlineKeyboardButton("No", callback_data="autoconsent:no")]])
             await update.effective_message.reply_text(
                 "Auto mode applies to jobs for you without asking each time.\n\n"
@@ -850,7 +1040,7 @@ async def auto_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"• You get a Telegram message with a Cancel button; mails wait at least {CANCEL_WINDOW_MIN} minutes "
                 f"and go out only Mon-Fri {WORK_START}:00-{WORK_END}:00 (Berlin).\n"
                 "• Letters are AI-written and not reviewed by a human before sending. They may contain mistakes.\n"
-                "• /delete removes all your data at any time.\n\n"
+                "• /delete removes all data of this profile at any time.\n\n"
                 "Do you agree?", reply_markup=kb)
             return
         await arun(db.update_user, uid, auto_on=True)
@@ -871,10 +1061,13 @@ async def auto_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ------------------------------------------------------------------ delete
 async def delete_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Yes, delete everything", callback_data="delete:yes"),
+    pid = await current_pid(update, ctx)
+    name = db.profile_name(await arun(db.get_user, pid))
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Yes, delete everything", callback_data=cb("delete", "yes", pid)),
                                 InlineKeyboardButton("Cancel", callback_data="delete:no")]])
     await update.effective_message.reply_text(
-        "This permanently deletes your CV, attachments, profile, email connection, settings, drafts and "
+        f"Profile: {name}\n"
+        "This permanently deletes this profile's CV, attachments, email connection, settings, drafts and "
         "application history. "
         "Emails already sent to employers cannot be recalled.", reply_markup=kb)
 
@@ -893,8 +1086,7 @@ async def wipe_user(uid: int):
 
 
 # ------------------------------------------------------------------ drafts and buttons
-async def make_draft(q, job: dict):
-    uid = q.from_user.id
+async def make_draft(q, job: dict, uid: int):
     user = await arun(db.get_user, uid)
     if not user or not user.get("profile"):
         await q.message.reply_text("Send your CV first.")
@@ -902,23 +1094,27 @@ async def make_draft(q, job: dict):
     note = await q.message.reply_text("✍️ Writing your cover letter...")
     try:
         with step(f"write cover letter {job['refnr']}"):
-            letter = await asyncio.to_thread(write_letter_sync, user["profile"], job, user.get("note"))
+            letter = await asyncio.to_thread(write_letter_sync, user["profile"], job, user.get("note"),
+                                             USER_WAIT_S)
+    except GeminiBusy:
+        await note.edit_text("⏳ Google's AI (Gemini) is overloaded right now. Press Apply again in a few minutes.")
+        return
     except Exception as e:
         log.exception("letter failed")
         await note.edit_text(f"Could not write the letter: {e}")
         return
     await arun(db.upsert_app, uid, job, status="draft", mode="manual", letter=letter, error=None)
     ref = job["refnr"]
-    preview = f"<b>{esc(letter['subject'])}</b>\n\n{esc(letter['body'])}"
+    preview = f"👤 {esc(db.profile_name(user))}\n<b>{esc(letter['subject'])}</b>\n\n{esc(letter['body'])}"
     if job.get("email"):
-        kb = [[InlineKeyboardButton("✉️ Send to employer", callback_data=f"send:{ref}"),
-               InlineKeyboardButton("🔄 Rewrite", callback_data=f"regen:{ref}"),
-               InlineKeyboardButton("✖ Cancel", callback_data=f"cancel:{ref}")]]
+        kb = [[InlineKeyboardButton("✉️ Send to employer", callback_data=cb("send", ref, uid)),
+               InlineKeyboardButton("🔄 Rewrite", callback_data=cb("regen", ref, uid)),
+               InlineKeyboardButton("✖ Cancel", callback_data=cb("cancel", ref, uid))]]
         await note.edit_text(preview, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
     else:
         kb = [[InlineKeyboardButton("🔗 Open application page", url=job["url"])],
-              [InlineKeyboardButton("🔄 Rewrite", callback_data=f"regen:{ref}"),
-               InlineKeyboardButton("✅ Mark as applied", callback_data=f"done:{ref}")]]
+              [InlineKeyboardButton("🔄 Rewrite", callback_data=cb("regen", ref, uid)),
+               InlineKeyboardButton("✅ Mark as applied", callback_data=cb("done", ref, uid))]]
         await note.edit_text(preview + "\n\n<i>This job uses a website form. Copy the letter, "
                              "or upload the PDF / DOCX below, and apply on the page.</i>",
                              parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
@@ -939,9 +1135,15 @@ async def make_draft(q, job: dict):
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    uid = q.from_user.id
     action, arg = q.data.split(":", 1)
-    log.info("[tg] button %s %s from user %s", action, arg, uid)
+    arg, _, pid_s = arg.partition("@")
+    uid = await current_pid(update, ctx)
+    if pid_s.lstrip("-").isdigit():                   # the button belongs to a specific profile
+        uid = int(pid_s)
+        if not await owned_profile(q.from_user.id, uid):
+            await q.message.reply_text("That profile no longer exists.")
+            return
+    log.info("[tg] button %s %s from user %s (profile %s)", action, arg, q.from_user.id, uid)
 
     # ---- consent / delete
     if action == "autoconsent":
@@ -956,8 +1158,11 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if action == "delete":
         await clear_kb(q)
         if arg == "yes":
+            name = db.profile_name(await arun(db.get_user, uid))
             await wipe_user(uid)
-            await q.message.reply_text("🗑 All your data was deleted. Send a CV to start again.")
+            if uid != q.from_user.id:                 # an extra profile: switch back to the owner's own
+                await set_active(q.from_user.id, q.from_user.id, ctx)
+            await q.message.reply_text(f"🗑 Profile {name} and all its data were deleted.")
         else:
             await q.message.reply_text("Cancelled. Nothing was deleted.")
         return
@@ -1000,7 +1205,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         if action == "regen":
             await clear_kb(q)
-        await make_draft(q, job)
+        await make_draft(q, job, uid)
 
     elif action == "done":
         ok = await arun(db.set_status, uid, refnr, "applied_manual", ["draft"])

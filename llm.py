@@ -10,7 +10,7 @@ import httpx
 from google import genai
 from google.genai import errors as gerr, types as gtypes
 
-from config import MODEL, DRY_RUN, log
+from config import MODEL, FALLBACK_MODEL, DRY_RUN, log
 
 
 # ------------------------------------------------------------------ key pool
@@ -67,20 +67,78 @@ class KeyPool:
 POOL = KeyPool(load_keys())
 # One client per key: no global configure(), so calls from different threads run in parallel.
 CLIENTS = [genai.Client(api_key=k, http_options=gtypes.HttpOptions(timeout=120_000)) for k in POOL.keys]
-GEN_CONFIG = gtypes.GenerateContentConfig(response_mime_type="application/json", temperature=0.2)
-log.info("Loaded %d Gemini API key(s), model=%s, DRY_RUN=%s", len(POOL.keys), MODEL, DRY_RUN)
+log.info("Loaded %d Gemini API key(s), model=%s, fallback=%s, DRY_RUN=%s",
+         len(POOL.keys), MODEL, FALLBACK_MODEL or "-", DRY_RUN)
+
+OVERLOAD_SWITCH = 2          # consecutive 503/504/timeouts on one model before trying the other one
+PRIMARY_REST_S = 300         # after an overload switch, new calls start on the fallback for 5 minutes
+_state = {"primary_busy_until": 0.0, "fallback_broken": False}
+_state_lock = threading.Lock()
 
 
-def gemini_json(parts, label: str = "gemini"):
-    """Call Gemini expecting JSON. Rotates keys on quota/auth errors, backs off on transient ones."""
+class GeminiBusy(RuntimeError):
+    """Gemini stayed overloaded until the caller's deadline. Safe to show to the user."""
+
+
+def _config(timeout_s: float) -> gtypes.GenerateContentConfig:
+    return gtypes.GenerateContentConfig(
+        response_mime_type="application/json", temperature=0.2,
+        automatic_function_calling=gtypes.AutomaticFunctionCallingConfig(disable=True),
+        http_options=gtypes.HttpOptions(timeout=int(timeout_s * 1000)))
+
+
+def _err_text(e: gerr.APIError) -> str:
+    return f"{e.code} {getattr(e, 'status', '') or ''}: {(getattr(e, 'message', '') or str(e))[:200]}".strip()
+
+
+def _start_model() -> str:
+    with _state_lock:
+        use_fb = (FALLBACK_MODEL and not _state["fallback_broken"]
+                  and time.time() < _state["primary_busy_until"])
+    return FALLBACK_MODEL if use_fb else MODEL
+
+
+def gemini_json(parts, label: str = "gemini", deadline_s: Optional[float] = None):
+    """Call Gemini expecting JSON. Rotates keys on quota/auth errors, backs off on transient ones,
+    switches to GEMINI_FALLBACK_MODEL when the model is overloaded (503/504).
+    deadline_s: give up with GeminiBusy after this many seconds (for calls a user is waiting on)."""
     max_attempts = max(8, len(POOL.keys) * 3)
+    t0 = time.time()
+    model = _start_model()
+    overloads = 0                                   # consecutive overloads on `model`
     last_err = None
+
+    def remaining() -> float:
+        return float("inf") if deadline_s is None else deadline_s - (time.time() - t0)
+
+    def backoff(attempt: int, why: str):
+        nonlocal model, overloads
+        overloads += 1
+        if overloads >= OVERLOAD_SWITCH and FALLBACK_MODEL and not _state["fallback_broken"]:
+            if model == MODEL:
+                with _state_lock:
+                    _state["primary_busy_until"] = time.time() + PRIMARY_REST_S
+            model = FALLBACK_MODEL if model == MODEL else MODEL
+            overloads = 0
+            log.warning("[gemini] %s: %s -> switching to model %s", label, why, model)
+            if model == FALLBACK_MODEL:
+                return                              # first hop: try the fallback right away
+            # both models overloaded: wait before going back to the primary
+        delay = min(2 ** attempt, 20)
+        if delay >= remaining():
+            raise GeminiBusy(f"Gemini is overloaded right now ({why}). Please try again in a few minutes.")
+        log.warning("[gemini] %s: %s -> retry in %ds", label, why, delay)
+        time.sleep(delay)
+
     for attempt in range(1, max_attempts + 1):
+        if remaining() <= 5:
+            raise GeminiBusy(f"Gemini did not answer in time ({last_err}). Please try again in a few minutes.")
         ki = POOL.acquire()
-        tag = f"{label} key#{ki} attempt {attempt}/{max_attempts}"
+        tag = f"{label} model={model} key#{ki} attempt {attempt}/{max_attempts}"
         try:
             log.info("[gemini] %s: request", tag)
-            resp = CLIENTS[ki].models.generate_content(model=MODEL, contents=parts, config=GEN_CONFIG)
+            resp = CLIENTS[ki].models.generate_content(
+                model=model, contents=parts, config=_config(min(120, max(15, remaining()))))
             data = json.loads(resp.text or "")
             log.info("[gemini] %s: OK", tag)
             return data
@@ -89,27 +147,31 @@ def gemini_json(parts, label: str = "gemini"):
             last_err = e
             code, msg = e.code, str(e).lower()
             if code == 429:
-                log.warning("[gemini] %s: quota/rate limit -> switching key (cooldown 60s)", tag)
+                log.warning("[gemini] %s: quota/rate limit (%s) -> switching key (cooldown 60s)", tag, _err_text(e))
                 POOL.cool(ki, 60)
             elif code in (401, 403) or (code == 400 and "api key" in msg):
-                log.error("[gemini] %s: key rejected (HTTP %s) -> disabling this key", tag, code)
+                log.error("[gemini] %s: key rejected (%s) -> disabling this key", tag, _err_text(e))
                 POOL.kill(ki)
+            elif code == 404 and model == FALLBACK_MODEL:
+                log.error("[gemini] fallback model %s not found (%s) -> fallback disabled",
+                          FALLBACK_MODEL, _err_text(e))
+                with _state_lock:
+                    _state["fallback_broken"] = True
+                model, overloads = MODEL, 0
             elif code == 408 or code >= 500:
-                delay = min(2 ** attempt, 20)
-                log.warning("[gemini] %s: transient HTTP %s -> retry in %ds", tag, code, delay)
-                time.sleep(delay)
+                backoff(attempt, f"overloaded {_err_text(e)}" if code in (503, 504) else _err_text(e))
             else:
-                log.error("[gemini] %s: bad request (HTTP %s): %s", tag, code, e)
+                log.error("[gemini] %s: bad request (%s)", tag, _err_text(e))
                 raise
         except (httpx.TimeoutException, httpx.TransportError) as e:
             last_err = e
-            delay = min(2 ** attempt, 20)
-            log.warning("[gemini] %s: network %s -> retry in %ds", tag, type(e).__name__, delay)
-            time.sleep(delay)
+            backoff(attempt, f"network {type(e).__name__}")
         except (json.JSONDecodeError, ValueError) as e:
             last_err = e
             log.warning("[gemini] %s: bad/empty response (%s) -> retry", tag, e)
             time.sleep(1)
+    if deadline_s is not None:
+        raise GeminiBusy(f"Gemini is overloaded right now ({last_err}). Please try again in a few minutes.")
     raise RuntimeError(f"Gemini failed after {max_attempts} attempts: {last_err}")
 
 
@@ -125,17 +187,17 @@ education (short string), summary (2 sentences).
 Use null if something is not in the CV. Do not invent information."""
 
 
-def parse_cv_sync(path: Path) -> dict:
+def parse_cv_sync(path: Path, deadline_s: Optional[float] = None) -> dict:
     if path.suffix.lower() == ".pdf":
         part = gtypes.Part.from_bytes(data=path.read_bytes(), mime_type="application/pdf")
-        data = gemini_json([PROFILE_PROMPT, part], label="parse-cv")
+        data = gemini_json([PROFILE_PROMPT, part], label="parse-cv", deadline_s=deadline_s)
     else:
         d = docx.Document(str(path))
         text = "\n".join(p.text for p in d.paragraphs)
         for t in d.tables:
             for row in t.rows:
                 text += "\n" + " | ".join(c.text for c in row.cells)
-        data = gemini_json([PROFILE_PROMPT, text], label="parse-cv")
+        data = gemini_json([PROFILE_PROMPT, text], label="parse-cv", deadline_s=deadline_s)
     if isinstance(data, list) and data:
         data = data[0]
     if not isinstance(data, dict):
@@ -168,14 +230,15 @@ description: {description}
 """
 
 
-def write_letter_sync(profile: dict, job: dict, note: Optional[str] = None) -> dict:
+def write_letter_sync(profile: dict, job: dict, note: Optional[str] = None,
+                      deadline_s: Optional[float] = None) -> dict:
     prompt = LETTER_PROMPT.format(
         profile=json.dumps(profile, ensure_ascii=False),
         note=(note or "none"),
         title=job["title"], employer=job["employer"], refnr=job["refnr"],
         description=(job["description"] or "")[:3000],
     )
-    data = gemini_json(prompt, label="cover-letter")
+    data = gemini_json(prompt, label="cover-letter", deadline_s=deadline_s)
     if isinstance(data, list) and data:
         data = data[0]
     return {"subject": str(data["subject"]), "body": str(data["body"])}

@@ -236,3 +236,33 @@ def add_bad_email(addr: str, reason: str) -> None:
 def bad_emails() -> set:
     r = sb.table(T_BAD).select("email").limit(50000).execute()
     return {x["email"] for x in r.data}
+
+
+# ------------------------------------------------------------------ profiles (several candidates per Telegram account)
+# The owner's own row has tg_id = Telegram id. Extra profiles get a random NEGATIVE tg_id (never a real
+# Telegram id) and owner_id = the Telegram id that manages them. All other tables keep using tg_id.
+def chat_id(u: Optional[dict]) -> Optional[int]:
+    """Telegram chat to notify for a profile row."""
+    if not u:
+        return None
+    return u.get("owner_id") or (u["tg_id"] if u["tg_id"] > 0 else None)
+
+
+def profile_name(u: Optional[dict]) -> str:
+    return ((u or {}).get("profile") or {}).get("full_name") or "New profile"
+
+
+def list_profiles(owner: int) -> list:
+    r = (sb.table(T_USERS).select("*").or_(f"tg_id.eq.{owner},owner_id.eq.{owner}")
+         .order("created_at").execute())
+    return r.data
+
+
+def create_profile(owner: int) -> int:
+    import random
+    for _ in range(5):
+        pid = -random.randint(10 ** 11, 10 ** 12 - 1)
+        if not get_user(pid):
+            sb.table(T_USERS).insert({"tg_id": pid, "owner_id": owner, "updated_at": now_iso()}).execute()
+            return pid
+    raise RuntimeError("could not allocate a profile id")
