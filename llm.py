@@ -213,7 +213,10 @@ def parse_cv_sync(path: Path, deadline_s: Optional[float] = None) -> dict:
 
 
 # ------------------------------------------------------------------ cover letter
-LETTER_PROMPT = """Write a German cover letter (Anschreiben) for this job application.
+LETTER_LANGS = {"de": "🇩🇪 German", "en": "🇬🇧 English"}      # first = default
+
+_LETTER_RULES = {
+    "de": """Write a German cover letter (Anschreiben) for this job application.
 Return ONLY JSON: {{"subject": str, "body": str}}.
 Rules:
 - body starts with "Sehr geehrte Damen und Herren," and ends with "Mit freundlichen Grüßen" and the candidate's full name on the next line.
@@ -222,7 +225,21 @@ Rules:
   language levels, a start date, or a move to Germany. Do not mention missing requirements.
 - The candidate note (if any) was written by the candidate. Work it in naturally where it fits (availability, relocation, etc.).
 - subject: "Bewerbung als <job title> (Referenznummer <refnr>)".
+""",
+    "en": """Write an English cover letter for this job application (the job ad may be in German; write in English anyway).
+Return ONLY JSON: {{"subject": str, "body": str}}.
+Rules:
+- body starts with "Dear Hiring Team," and ends with "Kind regards," and the candidate's full name on the next line.
+- 170-230 words, professional, concrete. Connect 2-3 REAL skills or experiences from the profile to the job requirements.
+- Use ONLY facts from the candidate profile and the candidate note. Never invent employers, degrees, numbers, certificates,
+  language levels, a start date, or a move to Germany. Do not mention missing requirements.
+- The candidate note (if any) was written by the candidate. Work it in naturally where it fits (availability, relocation, etc.).
+- Keep the job title exactly as written in the ad.
+- subject: "Application for <job title> (Reference number <refnr>)".
+""",
+}
 
+LETTER_PROMPT = """{rules}
 CANDIDATE PROFILE:
 {profile}
 
@@ -237,9 +254,16 @@ description: {description}
 """
 
 
+def letter_lang(u: Optional[dict]) -> str:
+    lang = (u or {}).get("letter_lang") or "de"
+    return lang if lang in LETTER_LANGS else "de"
+
+
 def write_letter_sync(profile: dict, job: dict, note: Optional[str] = None,
-                      deadline_s: Optional[float] = None) -> dict:
+                      deadline_s: Optional[float] = None, lang: str = "de") -> dict:
+    lang = lang if lang in LETTER_LANGS else "de"
     prompt = LETTER_PROMPT.format(
+        rules=_LETTER_RULES[lang],
         profile=json.dumps(profile, ensure_ascii=False),
         note=(note or "none"),
         title=job["title"], employer=job["employer"], refnr=job["refnr"],
@@ -248,7 +272,7 @@ def write_letter_sync(profile: dict, job: dict, note: Optional[str] = None,
     data = gemini_json(prompt, label="cover-letter", deadline_s=deadline_s)
     if isinstance(data, list) and data:
         data = data[0]
-    return {"subject": str(data["subject"]), "body": str(data["body"])}
+    return {"subject": str(data["subject"]), "body": str(data["body"]), "lang": lang}
 
 
 def letter_docx(uid: int, job: dict, letter: dict) -> Path:

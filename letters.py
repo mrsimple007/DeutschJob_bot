@@ -36,6 +36,18 @@ def _setup_font(pdf: FPDF):
     return "Helvetica", lambda s: s.translate(_TO_LATIN1).encode("latin-1", "replace").decode("latin-1")
 
 
+_FILE_WORDS = {"de": {"letter": "Anschreiben", "cv": "Lebenslauf"},
+               "en": {"letter": "Cover_Letter", "cv": "CV"}}
+
+
+def file_word(letter: dict, kind: str) -> str:
+    return _FILE_WORDS.get((letter or {}).get("lang") or "de", _FILE_WORDS["de"])[kind]
+
+
+def job_url(job: dict) -> str:
+    return (job or {}).get("url") or f"https://www.arbeitsagentur.de/jobsuche/jobdetail/{(job or {}).get('refnr', '')}"
+
+
 def safe_name(s: str) -> str:
     return re.sub(r"[^\w-]+", "_", s or "", flags=re.UNICODE).strip("_")[:60] or "Bewerbung"
 
@@ -45,7 +57,7 @@ def letter_pdf(profile: dict, job: dict, letter: dict) -> bytes:
     pdf = FPDF(format="A4", unit="mm")
     pdf.set_margins(25, 20, 20)
     pdf.set_auto_page_break(True, margin=20)
-    pdf.set_title(letter.get("subject") or "Anschreiben")
+    pdf.set_title(letter.get("subject") or file_word(letter, "letter"))
     pdf.set_author(profile.get("full_name") or "")
     pdf.add_page()
     fam, t = _setup_font(pdf)

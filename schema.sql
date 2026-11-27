@@ -210,3 +210,8 @@ alter table deutschjob_users
   add column if not exists active_profile bigint;
 create index if not exists deutschjob_users_owner_idx on deutschjob_users (owner_id);
 notify pgrst, 'reload schema';
+
+-- 8. Cover letter language per profile: 'de' (default) or 'en'
+alter table deutschjob_users
+  add column if not exists letter_lang text not null default 'de' check (letter_lang in ('de','en'));
+notify pgrst, 'reload schema';

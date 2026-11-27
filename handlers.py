@@ -8,13 +8,13 @@ import sheets
 import db, mailer, storage, crypto
 from db import arun, now_iso
 from jobs import find_jobs_cached
-from llm import parse_cv_sync, write_letter_sync, letter_docx, GeminiBusy
+from llm import parse_cv_sync, write_letter_sync, letter_docx, GeminiBusy, letter_lang, LETTER_LANGS
 from matching import quick_info
 from autopilot import fmt_stats_line
 from config import (MAX_SHOW, DRY_RUN, ALLOW_SHARED_SENDER, ADMIN_IDS, EMAIL_RE,
                     CANCEL_WINDOW_MIN, WORK_START, WORK_END, MAX_PROFILES, USER_WAIT_S, log, step)
 import autopilot
-from autopilot import cb
+from autopilot import cb, job_line
 import replies
 import letters
 from collections import defaultdict
@@ -85,7 +85,8 @@ def main_menu(uid: int) -> InlineKeyboardMarkup:
         [B("🕘 History", callback_data="menu:history"), B("📝 Note", callback_data="menu:note")],
 
         [B("📬 Replies", callback_data="menu:replies"), B("⚡ Run now", callback_data="menu:run")],
-        [B("📎 Attachments", callback_data="menu:files"), B("🗑 Delete my data", callback_data="menu:delete")],
+        [B("📎 Attachments", callback_data="menu:files"), B("🌐 Letter language", callback_data="menu:language")],
+        [B("🗑 Delete my data", callback_data="menu:delete")],
     ]
     if is_admin(uid):
         rows.append([B("👥 Clients", callback_data="adm:open"), B("📊 Sheet", callback_data="adm:sheet")])
@@ -129,6 +130,7 @@ PUBLIC_COMMANDS = [
     BotCommand("run", "Run a scan and send applications immediately"),
     BotCommand("replies", "Track employer replies in your inbox"),
     BotCommand("files", "Certificates and references sent with applications"),
+    BotCommand("language", "Cover letter language: German or English"),
     BotCommand("delete", "Delete all your data"),
 ]
 ADMIN_COMMANDS = PUBLIC_COMMANDS + [
@@ -283,7 +285,8 @@ async def on_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     actions = {"search": search_cmd, "profile": profile_cmd, "sender": sender_cmd, "auto": auto_cmd,
                "location": location_cmd, "stats": stats_cmd, "history": history_cmd,
-               "note": note_cmd, "delete": delete_cmd, "run": run_cmd, "replies": replies_cmd, "files": files_cmd}
+               "note": note_cmd, "delete": delete_cmd, "run": run_cmd, "replies": replies_cmd, "files": files_cmd,
+               "language": language_cmd}
     fn = actions.get(q.data.split(":", 1)[1])
     if fn:
         ctx.args = []
@@ -656,7 +659,8 @@ async def _profiles_view(owner: int, active: int):
             f"{star}<b>{esc(name)}</b> · {_langs(p)}\n"
             f"   {'🟢 auto ON' if p.get('auto_on') else '⚪ auto off'} · {today}/{p.get('daily_limit')} today · "
             f"📍 {esc(p.get('location') or 'all DE')}\n"
-            f"   ✉️ {esc(p.get('smtp_user') or 'no sender')} · 📬 replies {'ON' if p.get('track_replies') else 'off'}"
+            f"   ✍️ {LETTER_LANGS[letter_lang(p)]} letters · ✉️ {esc(p.get('smtp_user') or 'no sender')} · "
+            f"📬 replies {'ON' if p.get('track_replies') else 'off'}"
             f"{'' if p.get('cv_path') else ' · ⚠️ no CV'}")
         kb.append([B(f"{star}{'🟢' if p.get('auto_on') else '⚪'} {name[:24]} · "
                      f"{(p.get('profile') or {}).get('german_level') or '?'} · {today}/{p.get('daily_limit')}",
@@ -682,6 +686,7 @@ async def _profile_card(p: dict, active: int):
             f"🔎 {esc(', '.join(prof.get('job_titles') or []) or '-')}\n"
             f"📍 Search: {esc(p.get('location') or 'all of Germany')}\n"
             f"📄 CV: {'yes' if p.get('cv_path') else 'missing'} · 📎 extra files: {len(p.get('attachments') or [])}\n"
+            f"✍️ Letter language: {LETTER_LANGS[letter_lang(p)]}\n"
             f"✉️ Sender: {esc(p.get('smtp_user') or 'not connected')}\n"
             f"📬 Reply tracking: {'ON' if p.get('track_replies') else 'off'}\n"
             f"🤖 Auto: {'🟢 ON' if on else '⚪ off'} · {today}/{p.get('daily_limit')} today"
@@ -692,6 +697,8 @@ async def _profile_card(p: dict, active: int):
     kb.append([B("🔴 Auto OFF" if on else "🟢 Auto ON", callback_data=f"prof:auto:{pid}:{'off' if on else 'on'}")])
     kb.append([B(("✅ " if p.get("daily_limit") == n else "") + f"{n}/day", callback_data=f"prof:lim:{pid}:{n}")
                for n in (3, 5, 15, MAX_DAILY)])
+    kb.append([B(("✅ " if letter_lang(p) == code else "") + label, callback_data=f"prof:lang:{pid}:{code}")
+               for code, label in LETTER_LANGS.items()])
     kb.append([B("⚡ Run now", callback_data=f"prof:run:{pid}"), B("🔎 Search", callback_data=f"prof:search:{pid}")])
     kb.append([B("📧 Sender", callback_data=f"prof:sender:{pid}"), B("📬 Replies", callback_data=f"prof:rep:{pid}"),
                B("📎 Files", callback_data=f"prof:files:{pid}")])
@@ -759,6 +766,10 @@ async def on_profiles(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await arun(db.update_user, pid, daily_limit=int(parts[3]))
         await q.answer(f"Limit {parts[3]}/day")
         await show(*await _profile_card(await arun(db.get_user, pid), active))
+    elif kind == "lang" and len(parts) > 3 and parts[3] in LETTER_LANGS:
+        await arun(db.update_user, pid, letter_lang=parts[3])
+        await q.answer(f"Letters: {LETTER_LANGS[parts[3]]}")
+        await show(*await _profile_card(await arun(db.get_user, pid), active))
     elif kind == "del":
         await q.answer()
         await show(f"🗑 Delete profile <b>{esc(db.profile_name(p))}</b> with its CV, attachments, sender, "
@@ -787,6 +798,47 @@ async def on_profiles(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         fn, args = actions[kind]
         ctx.args = list(args)
         await fn(update, ctx)
+
+
+# ------------------------------------------------------------------ letter language
+def _lang_kb(cur: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[B(("✅ " if cur == code else "") + label, callback_data=f"lang:{code}")
+                                  for code, label in LETTER_LANGS.items()]])
+
+
+async def language_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    pid = await current_pid(update, ctx)
+    user = await arun(db.get_user, pid)
+    arg = (ctx.args[0].lower() if ctx.args else "")
+    if arg in LETTER_LANGS:
+        await arun(db.update_user, pid, letter_lang=arg)
+        user = {**(user or {}), "letter_lang": arg}
+        await update.effective_message.reply_text(f"✅ New cover letters for {db.profile_name(user)}: "
+                                                  f"{LETTER_LANGS[arg]}.")
+        return
+    cur = letter_lang(user)
+    await update.effective_message.reply_text(
+        f"✍️ Cover letter language for {db.profile_name(user)}: {LETTER_LANGS[cur]}\n\n"
+        "Applies to new letters (auto mode and Apply). Letters already queued keep their language.",
+        reply_markup=_lang_kb(cur))
+
+
+async def on_lang(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    code = q.data.split(":", 1)[1]
+    if code not in LETTER_LANGS:
+        await q.answer()
+        return
+    pid = await current_pid(update, ctx)
+    await arun(db.update_user, pid, letter_lang=code)
+    await q.answer(f"Letters: {LETTER_LANGS[code]}")
+    user = await arun(db.get_user, pid)
+    try:
+        await q.edit_message_text(f"✍️ Cover letter language for {db.profile_name(user)}: {LETTER_LANGS[code]}\n\n"
+                                  "Applies to new letters (auto mode and Apply). Letters already queued keep "
+                                  "their language.", reply_markup=_lang_kb(code))
+    except Exception:
+        pass
 
 
 # ------------------------------------------------------------------ stats / admin
@@ -1095,7 +1147,7 @@ async def make_draft(q, job: dict, uid: int):
     try:
         with step(f"write cover letter {job['refnr']}"):
             letter = await asyncio.to_thread(write_letter_sync, user["profile"], job, user.get("note"),
-                                             USER_WAIT_S)
+                                             USER_WAIT_S, letter_lang(user))
     except GeminiBusy:
         await note.edit_text("⏳ Google's AI (Gemini) is overloaded right now. Press Apply again in a few minutes.")
         return
@@ -1105,7 +1157,8 @@ async def make_draft(q, job: dict, uid: int):
         return
     await arun(db.upsert_app, uid, job, status="draft", mode="manual", letter=letter, error=None)
     ref = job["refnr"]
-    preview = f"👤 {esc(db.profile_name(user))}\n<b>{esc(letter['subject'])}</b>\n\n{esc(letter['body'])}"
+    preview = (f"👤 {esc(db.profile_name(user))} · {LETTER_LANGS[letter['lang']]} letter\n"
+               f"<b>{esc(letter['subject'])}</b>\n\n{esc(letter['body'])}")
     if job.get("email"):
         kb = [[InlineKeyboardButton("✉️ Send to employer", callback_data=cb("send", ref, uid)),
                InlineKeyboardButton("🔄 Rewrite", callback_data=cb("regen", ref, uid)),
@@ -1121,13 +1174,13 @@ async def make_draft(q, job: dict, uid: int):
         name = letters.safe_name(user["profile"].get("full_name") or "")
         try:
             pdf = await asyncio.to_thread(letters.letter_pdf, user["profile"], job, letter)
-            await q.message.reply_document(pdf, filename=f"Anschreiben_{name}.pdf")
+            await q.message.reply_document(pdf, filename=f"{letters.file_word(letter, 'letter')}_{name}.pdf")
         except Exception:
             log.exception("[letters] PDF failed for %s", ref)
         path = await asyncio.to_thread(letter_docx, uid, job, letter)
         try:
             with open(path, "rb") as fh:
-                await q.message.reply_document(fh, filename=f"Anschreiben_{name}.docx")
+                await q.message.reply_document(fh, filename=f"{letters.file_word(letter, 'letter')}_{name}.docx")
         finally:
             path.unlink(missing_ok=True)
 
@@ -1240,4 +1293,5 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                    sent_at=now_iso(), error=None, to_email=job["email"], message_id=msg_id)
         await clear_kb(q)
         note = " (DRY RUN: sent to yourself)" if DRY_RUN else ""
-        await q.message.reply_text(f"✅ Application sent to {sent_to}{note}")
+        await q.message.reply_text(f"✅ Application sent to {esc(sent_to)}{note}\n{job_line(job, app['letter'])}",
+                                   parse_mode="HTML", disable_web_page_preview=True)

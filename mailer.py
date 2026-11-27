@@ -75,11 +75,13 @@ def application_files(user: dict, job: dict, letter: dict) -> list:
     name = letters.safe_name(profile.get("full_name") or "")
     files = []
     try:
-        files.append((f"Anschreiben_{name}.pdf", letters.letter_pdf(profile, job, letter), "application/pdf"))
+        files.append((f"{letters.file_word(letter, 'letter')}_{name}.pdf",
+                      letters.letter_pdf(profile, job, letter), "application/pdf"))
     except Exception:
         log.exception("[mail] cover letter PDF failed, sending without it")   # the letter is in the body anyway
     ext = Path(user["cv_path"]).suffix
-    files.append((f"Lebenslauf_{name}{ext}", storage.download_cv(user["cv_path"]), storage.cv_mime(ext)))
+    files.append((f"{letters.file_word(letter, 'cv')}_{name}{ext}", storage.download_cv(user["cv_path"]),
+                  storage.cv_mime(ext)))
     for a in user.get("attachments") or []:
         files.append((a["name"], storage.download(a["key"]), a.get("mime") or "application/octet-stream"))
     total = sum(len(f[1]) for f in files)

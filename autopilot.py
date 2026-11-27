@@ -8,7 +8,8 @@ import sheets
 import db, mailer
 from db import arun
 from jobs import find_jobs_cached, is_bad_email
-from llm import write_letter_sync
+from llm import write_letter_sync, letter_lang, LETTER_LANGS
+from letters import job_url
 from matching import quick_info
 from config import (TZ, WORK_START, WORK_END, CANCEL_WINDOW_MIN, JITTER_MAX_MIN, SEND_BATCH,
                     SEND_GAP, EMPLOYER_COOLDOWN_DAYS, DRY_RUN, ALLOW_SHARED_SENDER, ADMIN_IDS, log)
@@ -19,6 +20,12 @@ esc = lambda x: html.escape(str(x if x is not None else ""))
 def who_tag(u) -> str:
     """'👤 Name' line so the owner of several profiles knows which candidate a message is about."""
     return f"👤 <b>{esc(db.profile_name(u))}</b>\n"
+
+
+def job_line(job: dict, letter) -> str:
+    """'🔗 Job ad · 🇬🇧 English letter' line for Telegram messages (HTML)."""
+    lang = LETTER_LANGS.get((letter or {}).get("lang") or "de", LETTER_LANGS["de"])
+    return f'🔗 <a href="{esc(job_url(job))}">Job ad</a> · {lang} letter'
 
 
 def cb(action: str, refnr: str, pid: int) -> str:
@@ -88,7 +95,7 @@ async def scan_user(ctx: ContextTypes.DEFAULT_TYPE, u: dict, immediate: bool = F
             st["cooldown"] += 1
             continue
         try:
-            letter = await asyncio.to_thread(write_letter_sync, profile, job, u.get("note"))
+            letter = await asyncio.to_thread(write_letter_sync, profile, job, u.get("note"), None, letter_lang(u))
         except Exception:
             log.exception("[auto] letter failed for %s", job["refnr"])
             st["letter_failed"] += 1
@@ -111,6 +118,7 @@ async def notify_queued(ctx, u, job, letter, send_after):
     uid = u["tg_id"]
     when = send_after.astimezone(TZ).strftime("%H:%M")
     text = (f"{who_tag(u)}🤖 <b>Auto-apply queued</b>\n{esc(job['title'])} · {esc(job['employer'])}\n"
+            f"{job_line(job, letter)}\n"
             f"Not before {when} (Berlin). Sends only Mon-Fri {WORK_START}:00-{WORK_END}:00.\n\n"
             f"<b>{esc(letter['subject'])}</b>\n\n{esc(letter['body'])}")
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("✖ Cancel", callback_data=cb("cancel", job["refnr"], uid))]])
@@ -177,6 +185,7 @@ async def send_one(ctx, row: dict) -> str:
     who = "?"
     delivered = False
     user = None
+    job = {"refnr": refnr}                                   # replaced by the stored job below (for the link)
     try:
         user = await arun(db.get_user, uid)
         if not user or not user.get("profile") or not user.get("cv_path"):
@@ -192,7 +201,8 @@ async def send_one(ctx, row: dict) -> str:
         sheets.fire(uid, refnr)
         _retries.pop(app_id, None)
         extra = " (DRY RUN: sent to yourself)" if DRY_RUN else ""
-        msg = f"✅ Auto-sent: {esc(row['title'])} · {esc(row['employer'])}\n→ {esc(sent_to)}{extra}"
+        msg = (f"✅ Auto-sent: {esc(row['title'])} · {esc(row['employer'])}\n→ {esc(sent_to)}{extra}\n"
+               f"{job_line(job, row.get('letter'))}")
         status = "ok"
     except Exception as e:
         n = _retries.get(app_id, 0) + 1
@@ -205,17 +215,20 @@ async def send_one(ctx, row: dict) -> str:
         log.exception("[auto] send failed for application %s", app_id)
         _retries.pop(app_id, None)
         if delivered:   # mail went out but DB update failed: don't mark failed (would invite a resend)
-            msg = f"✅ Auto-sent: {esc(row['title'])} · {esc(row['employer'])}"
+            msg = (f"✅ Auto-sent: {esc(row['title'])} · {esc(row['employer'])}\n"
+                   f"{job_line(job, row.get('letter'))}")
             status = "ok"
         else:
             await arun(db.mark_failed, app_id, str(e))
-            msg = f"⚠️ Auto-send failed: {esc(row['title'])} · {esc(row['employer'])}\n{esc(str(e)[:200])}"
+            msg = (f"⚠️ Auto-send failed: {esc(row['title'])} · {esc(row['employer'])}\n{esc(str(e)[:200])}\n"
+                   f"{job_line(job, row.get('letter'))}")
             await notify_admins(ctx, f"⚠️ <b>Send failed</b> for {esc(who)} ({uid})\n"
                                      f"{esc(row['title'])} · {esc(row['employer'])}\n{esc(str(e)[:300])}")
             status = "failed"
     try:
         if db.chat_id(user):
-            await ctx.bot.send_message(db.chat_id(user), who_tag(user) + msg, parse_mode="HTML")
+            await ctx.bot.send_message(db.chat_id(user), who_tag(user) + msg, parse_mode="HTML",
+                                       disable_web_page_preview=True)
     except Exception:
         log.warning("[auto] could not notify user %s", uid)
     return status
